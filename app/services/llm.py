@@ -31,7 +31,18 @@ DEFAULT_MODELS = {
     "gemini": "gemini-1.5-flash",
 }
 
-TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+# Screenshot transcription needs a vision-capable model. Claude 3.5 Haiku
+# (the text default above) doesn't accept image input via the API, so
+# vision calls override to Sonnet for Anthropic specifically; OpenAI's
+# gpt-4o-mini and Gemini 1.5 Flash already handle images, so they're
+# unchanged from the text defaults.
+VISION_MODELS = {
+    "anthropic": "claude-3-5-sonnet-20241022",
+    "openai": DEFAULT_MODELS["openai"],
+    "gemini": DEFAULT_MODELS["gemini"],
+}
+
+TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 
 @dataclass
@@ -85,6 +96,112 @@ class LLMRouter:
                     continue
 
         raise LLMUnavailableError(f"All configured LLM providers failed. Last error: {last_err}")
+
+    async def complete_vision(
+        self, system: str, prompt: str, images: list[dict], max_tokens: int = 2000
+    ) -> LLMResult:
+        """Like complete(), but for image input. `images` is a list of
+        {"data": base64_str, "media_type": "image/png"} dicts. Used for
+        screenshot transcription, where there's no text to send the
+        regular text-only providers — every fallback step here also needs
+        a vision-capable model, hence VISION_MODELS instead of DEFAULT_MODELS."""
+        providers = self.available_providers()
+        if not providers:
+            raise LLMUnavailableError(
+                "No LLM provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+                "or GEMINI_API_KEY in the backend environment."
+            )
+
+        last_err = None
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            for provider in providers:
+                try:
+                    if provider == "anthropic":
+                        text = await self._call_anthropic_vision(client, system, prompt, images, max_tokens)
+                    elif provider == "openai":
+                        text = await self._call_openai_vision(client, system, prompt, images, max_tokens)
+                    elif provider == "gemini":
+                        text = await self._call_gemini_vision(client, system, prompt, images)
+                    else:
+                        continue
+                    return LLMResult(text=text, provider=provider, model=VISION_MODELS[provider])
+                except Exception as e:  # noqa: BLE001 — same fallthrough rationale as complete()
+                    logger.warning("Vision provider %s failed: %s", provider, e)
+                    last_err = e
+                    continue
+
+        raise LLMUnavailableError(f"All configured vision providers failed. Last error: {last_err}")
+
+    async def _call_anthropic_vision(
+        self, client: httpx.AsyncClient, system: str, prompt: str, images: list[dict], max_tokens: int
+    ) -> str:
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": img["media_type"], "data": img["data"]}}
+            for img in images
+        ]
+        content.append({"type": "text", "text": prompt})
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self._keys["anthropic"],
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": VISION_MODELS["anthropic"],
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": [{"role": "user", "content": content}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return "".join(block.get("text", "") for block in data.get("content", []))
+
+    async def _call_openai_vision(
+        self, client: httpx.AsyncClient, system: str, prompt: str, images: list[dict], max_tokens: int
+    ) -> str:
+        content = [{"type": "text", "text": prompt}]
+        for img in images:
+            content.append({"type": "image_url", "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"}})
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self._keys['openai']}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": VISION_MODELS["openai"],
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    async def _call_gemini_vision(
+        self, client: httpx.AsyncClient, system: str, prompt: str, images: list[dict]
+    ) -> str:
+        model = VISION_MODELS["gemini"]
+        parts = [{"inline_data": {"mime_type": img["media_type"], "data": img["data"]}} for img in images]
+        parts.append({"text": prompt})
+        resp = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            params={"key": self._keys["gemini"]},
+            json={
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {"temperature": 0.0},
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
     async def _call_anthropic(self, client: httpx.AsyncClient, system: str, prompt: str) -> str:
         resp = await client.post(

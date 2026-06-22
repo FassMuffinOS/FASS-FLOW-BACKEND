@@ -22,7 +22,7 @@ the LLM's extraction of those fields is only used as a fallback, and is
 tagged as such, because a hallucinated date is worse than no date.
 """
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.services.llm import llm_router, extract_json, LLMUnavailableError
 from app.services.retrieval import rank_passages
@@ -180,4 +180,62 @@ Most relevant past performance on file (use only these, do not invent others):
         "provider": result.provider,
         "model": result.model,
         "grounded_in": [{"text": g["text"], "score": round(g["score"], 3)} for g in grounded],
+    }
+
+
+# ── /extract-from-image ──────────────────────────────────────────────
+# Continuity feature for WARDOG's "Other Sources" directory: FedConnect,
+# Unison Marketplace, and DIBBS sit behind vendor logins, so a server-side
+# fetch can't pull their content (and we don't script around vendor auth).
+# A screenshot sidesteps that entirely — the student is already looking at
+# the page in their own logged-in browser. This transcribes the image back
+# into plain text and hands it to the exact same parseSolicitation/AI
+# pipeline a regular paste would.
+
+MAX_IMAGES = 6  # generous for a multi-page solicitation excerpt, bounded against abuse/cost
+
+ALLOWED_MEDIA_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+
+
+class ImageInput(BaseModel):
+    data: str = Field(..., description="Base64-encoded image bytes, no data: URI prefix")
+    media_type: str = "image/png"
+
+
+class ExtractImageRequest(BaseModel):
+    images: list[ImageInput]
+
+
+EXTRACT_IMAGE_SYSTEM_PROMPT = """You are transcribing screenshots of a government contracting \
+solicitation (or a portal page listing one) so the text can be processed by a compliance tool. \
+Transcribe ALL readable text verbatim, in reading order, preserving section headings, numbering, \
+and bullet structure as plain text. Do not summarize, paraphrase, translate, or add commentary of \
+your own. If multiple images are provided, transcribe them in order and separate each with a line \
+reading "--- next image ---". If a region is blurry, cut off, or illegible, write [illegible] in \
+that spot rather than guessing at the content. Respond with ONLY the transcribed text."""
+
+
+@router.post("/extract-from-image")
+async def extract_from_image(body: ExtractImageRequest):
+    if not body.images:
+        raise HTTPException(status_code=400, detail="At least one image is required")
+    if len(body.images) > MAX_IMAGES:
+        raise HTTPException(status_code=400, detail=f"Max {MAX_IMAGES} images per request")
+    for img in body.images:
+        if img.media_type not in ALLOWED_MEDIA_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unsupported image type: {img.media_type}")
+
+    try:
+        result = await llm_router.complete_vision(
+            system=EXTRACT_IMAGE_SYSTEM_PROMPT,
+            prompt="Transcribe the solicitation text from the image(s) above.",
+            images=[{"data": img.data, "media_type": img.media_type} for img in body.images],
+        )
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {
+        "raw_text": result.text.strip(),
+        "provider": result.provider,
+        "model": result.model,
     }
