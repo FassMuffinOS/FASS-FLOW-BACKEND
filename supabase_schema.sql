@@ -86,3 +86,6 @@ create index opp_naics_idx      on public.opportunities(naics_code);
 create index opp_response_date  on public.opportunities(response_date);
 create index prop_user_idx      on public.proposals(user_id);
 create index prop_status_idx    on public.proposals(status);
+
+-- ── Admin manual-grant tracking (run once for /admin/invite + /admin/grant-access) ──
+alter table public.profiles add column if not exists admin_note text;

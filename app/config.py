@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     frontend_url: str = "http://localhost:5173"
     jwt_secret: str = "change-me"
+    admin_secret: str = ""  # required to use /admin/* routes; set in Railway, never commit
 
     # AI providers — all optional. The LLM router skips any provider
     # whose key is blank and falls through to the next one in order.

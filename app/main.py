@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routers import auth, subscriptions, users, ai
+from app.routers import auth, subscriptions, users, ai, admin
 
 app = FastAPI(
     title="FASS Flow API",
@@ -23,6 +23,7 @@ app.include_router(auth.router,          prefix="/api/v1")
 app.include_router(subscriptions.router, prefix="/api/v1")
 app.include_router(users.router,         prefix="/api/v1")
 app.include_router(ai.router,            prefix="/api/v1")
+app.include_router(admin.router,         prefix="/api/v1")
 
 
 @app.get("/health")
