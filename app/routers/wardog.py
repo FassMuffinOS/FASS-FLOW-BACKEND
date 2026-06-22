@@ -34,13 +34,19 @@ async def search_opportunities(
     if cached is not None:
         return cached
 
-    posted_from = (datetime.utcnow() - timedelta(days=30)).strftime("%m/%d/%Y")
+    # SAM.gov requires BOTH postedFrom and postedTo — omitting either causes
+    # a 400 from their API (which we were turning into an opaque 502 here).
+    today = datetime.utcnow()
+    posted_from = (today - timedelta(days=30)).strftime("%m/%d/%Y")
+    posted_to = today.strftime("%m/%d/%Y")
 
     params = {
         "api_key": settings.sam_gov_api_key,
         "limit": str(limit),
         "postedFrom": posted_from,
-        "naics": naics,
+        "postedTo": posted_to,
+        # SAM.gov's actual NAICS query param is "ncode", not "naics".
+        "ncode": naics,
         "active": "true",
     }
     if state:
@@ -55,7 +61,18 @@ async def search_opportunities(
         raise HTTPException(status_code=502, detail=f"Could not reach SAM.gov: {e}") from e
 
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"SAM.gov returned {resp.status_code}")
+        # Surface SAM.gov's actual error body instead of a bare status code —
+        # their API returns a useful message (e.g. "PostedFrom and PostedTo
+        # are mandatory", "An invalid api_key was supplied") that otherwise
+        # gets lost behind a generic 502 in the frontend's error banner.
+        try:
+            sam_detail = resp.json()
+        except ValueError:
+            sam_detail = resp.text
+        raise HTTPException(
+            status_code=502,
+            detail=f"SAM.gov returned {resp.status_code}: {sam_detail}",
+        )
 
     data = resp.json()
     opportunities = data.get("opportunitiesData", [])
