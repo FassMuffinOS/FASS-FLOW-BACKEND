@@ -12,7 +12,17 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "https://fassflow.com"],
+    # settings.frontend_url comes from Railway's FRONTEND_URL env var and may
+    # be unset or stale, so the live production domain is also hardcoded here
+    # as a fallback — a missing/wrong Railway var otherwise silently blocks
+    # every browser request with a generic "Failed to fetch" and no useful
+    # error message on either side.
+    allow_origins=[
+        settings.frontend_url,
+        "https://flow.fass.systems",
+        "https://fassflow.com",
+        "https://fass-flow-frontend.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
