@@ -83,9 +83,10 @@ async def stripe_webhook(
     elif event["type"] in (
         "invoice.payment_failed",
         "invoice.payment_succeeded",
+        "invoice.paid",
     ):
         inv = event["data"]["object"]
-        status = "active" if event["type"] == "invoice.payment_succeeded" else "past_due"
+        status = "past_due" if event["type"] == "invoice.payment_failed" else "active"
         (
             sb.table("profiles")
             .update({"subscription_status": status})
