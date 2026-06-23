@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from app.services.llm import llm_router, extract_json, LLMUnavailableError
 from app.services.retrieval import rank_passages
+from app.services.quota import check_and_consume_ai_quota
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -221,12 +222,14 @@ class ReadSynthesisRequest(BaseModel):
     solicitation_text: str
     title: str = ""
     agency: str = ""
+    user_id: str | None = None  # used only to enforce the Lite plan's quota
 
 
 @router.post("/read-synthesis")
 async def read_synthesis(body: ReadSynthesisRequest):
     if not body.solicitation_text.strip():
         raise HTTPException(status_code=400, detail="solicitation_text is required")
+    check_and_consume_ai_quota(body.user_id)
 
     categories_block = "\n".join(f"- {cid}: {desc}" for cid, desc in READ_CATEGORIES.items())
     prompt = f"""Solicitation: {body.title or '(untitled)'}{f' — {body.agency}' if body.agency else ''}
@@ -251,6 +254,87 @@ Solicitation text:
 
     return {
         "synthesis": clean,
+        "provider": result.provider,
+        "model": result.model,
+    }
+
+
+# ── /cost-breakdown ──────────────────────────────────────────────────
+# Show Me The Money's calculator is deliberately deterministic — award
+# amount, period of performance, and sub %  are inputs the USER supplies,
+# because nobody but the contractor knows their real numbers. What the
+# calculator can't do is read the *scope of work* and reason about what
+# kind of job it actually is. This endpoint is the judgment-call layer on
+# top of that: given the same scope text WARDOG/Inbox/FASS FILL already
+# saved on the proposal, produce a rough cost breakdown, a complexity/
+# effort read, and risk flags — explicitly framed as a starting estimate
+# for the contractor's own pricing process, not a quote.
+
+class CostBreakdownRequest(BaseModel):
+    scope_text: str
+    title: str = ""
+    agency: str = ""
+    award_amount: float | None = None
+    user_id: str | None = None  # used only to enforce the Lite plan's quota
+
+
+COST_BREAKDOWN_SYSTEM_PROMPT = """You are helping a small government contractor get a rough, \
+first-pass read on a job before they price it themselves. You will be given the scope of work \
+(from a solicitation, RFP excerpt, or invitation email) and possibly a known award ceiling. \
+Produce a single JSON object, no prose before or after it:
+
+{
+  "cost_estimate": {
+    "labor_pct": number,        // rough % of total cost that is labor
+    "materials_pct": number,    // rough % that is materials/parts/supplies
+    "equipment_pct": number,    // rough % that is equipment/tools/rental
+    "overhead_profit_pct": number, // rough % that is overhead + profit margin
+    "total_low": number or null,   // low end of a rough dollar estimate, if enough scope detail exists to guess
+    "total_high": number or null,  // high end of that estimate
+    "basis": string             // 1-2 sentences: what assumptions this estimate rests on, and what's missing that would sharpen it
+  },
+  "complexity": {
+    "level": "small" | "medium" | "large",
+    "crew_size": string,        // rough headcount/trade mix, e.g. "2-3 technicians, 1 supervisor"
+    "estimated_duration": string, // rough timeline to complete the described work, e.g. "2-3 weeks per site visit"
+    "rationale": string         // why this level, in 1-2 sentences grounded in the actual scope text
+  },
+  "risk_flags": [string]        // scope items that are unusually demanding, costly to get wrong, or easy to underbid (e.g. "requires after-hours access", "bonding likely required", "recurring inspection cadence not fully specified")
+}
+
+The four cost_estimate percentages should sum to roughly 100. If the scope text doesn't give enough \
+detail to produce a dollar range, set total_low and total_high to null rather than guessing wildly — \
+say so in "basis" instead. Do not invent contract values, site counts, or requirements not present in \
+the text. This is a rough order-of-magnitude read to help a contractor start their own estimate, not \
+a bid price. Respond with ONLY the JSON object."""
+
+
+@router.post("/cost-breakdown")
+async def cost_breakdown(body: CostBreakdownRequest):
+    if not body.scope_text.strip():
+        raise HTTPException(status_code=400, detail="scope_text is required")
+    check_and_consume_ai_quota(body.user_id)
+
+    award_line = f"Known award ceiling: ${body.award_amount:,.0f}" if body.award_amount else "Known award ceiling: not provided"
+    prompt = f"""Title: {body.title or '(untitled)'}
+Agency: {body.agency or '(not provided)'}
+{award_line}
+
+Scope of work text:
+{body.scope_text[:12000]}"""
+
+    try:
+        result = await llm_router.complete(system=COST_BREAKDOWN_SYSTEM_PROMPT, prompt=prompt, max_tokens=1200)
+        fields = extract_json(result.text)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"Model returned unparseable output: {e}") from e
+
+    return {
+        "cost_estimate": fields.get("cost_estimate", {}),
+        "complexity": fields.get("complexity", {}),
+        "risk_flags": fields.get("risk_flags") or [],
         "provider": result.provider,
         "model": result.model,
     }

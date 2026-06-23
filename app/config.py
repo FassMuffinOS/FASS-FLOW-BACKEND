@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     # Stripe
     stripe_secret_key: str
     stripe_webhook_secret: str
+    stripe_price_lite: str = ""    # $9.99/mo entry tier — read-only WARDOG + 1 AI synthesis/cycle
     stripe_price_starter: str = ""
     stripe_price_pro: str = ""
     stripe_price_team: str = ""

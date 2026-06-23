@@ -89,3 +89,10 @@ create index prop_status_idx    on public.proposals(status);
 
 -- ── Admin manual-grant tracking (run once for /admin/invite + /admin/grant-access) ──
 alter table public.profiles add column if not exists admin_note text;
+
+-- ── Lite plan AI quota tracking (run once for the $9.99/mo Lite tier) ──
+-- Lite is capped at 1 AI synthesis (read-synthesis, cost-breakdown, etc.)
+-- per 30-day billing cycle; every other plan is unlimited. ai_quota_reset_at
+-- starts null so the first AI call on a profile initializes the cycle.
+alter table public.profiles add column if not exists ai_quota_used integer not null default 0;
+alter table public.profiles add column if not exists ai_quota_reset_at timestamptz;

@@ -10,6 +10,7 @@ stripe.api_key = settings.stripe_secret_key
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
 PLAN_PRICE_MAP = {
+    "lite":    settings.stripe_price_lite,
     "starter": settings.stripe_price_starter,
     "pro":     settings.stripe_price_pro,
     "team":    settings.stripe_price_team,
@@ -17,7 +18,7 @@ PLAN_PRICE_MAP = {
 
 
 class CheckoutRequest(BaseModel):
-    plan: str          # "starter" | "pro" | "team"
+    plan: str          # "lite" | "starter" | "pro" | "team"
     user_id: str
     email: str
 
