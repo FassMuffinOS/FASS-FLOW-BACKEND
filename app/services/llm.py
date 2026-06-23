@@ -29,13 +29,17 @@ DEFAULT_MODELS = {
     "anthropic": "claude-3-5-haiku-20241022",
     "openai": "gpt-4o-mini",
     "gemini": "gemini-1.5-flash",
+    "deepseek": "deepseek-chat",
 }
 
 # Screenshot transcription needs a vision-capable model. Claude 3.5 Haiku
 # (the text default above) doesn't accept image input via the API, so
 # vision calls override to Sonnet for Anthropic specifically; OpenAI's
 # gpt-4o-mini and Gemini 1.5 Flash already handle images, so they're
-# unchanged from the text defaults.
+# unchanged from the text defaults. DeepSeek's public API has no
+# vision-capable chat model, so it's deliberately left out of this map —
+# the router's fallthrough (`else: continue`) skips it for vision calls
+# and falls to the next configured provider instead of erroring.
 VISION_MODELS = {
     "anthropic": "claude-3-5-sonnet-20241022",
     "openai": DEFAULT_MODELS["openai"],
@@ -62,6 +66,7 @@ class LLMRouter:
             "anthropic": settings.anthropic_api_key,
             "openai": settings.openai_api_key,
             "gemini": settings.gemini_api_key,
+            "deepseek": settings.deep_seek_api_key,
         }
         self._order = [p.strip() for p in settings.llm_provider_order.split(",") if p.strip()]
 
@@ -87,6 +92,8 @@ class LLMRouter:
                         text = await self._call_openai(client, system, prompt)
                     elif provider == "gemini":
                         text = await self._call_gemini(client, system, prompt)
+                    elif provider == "deepseek":
+                        text = await self._call_deepseek(client, system, prompt)
                     else:
                         continue
                     return LLMResult(text=text, provider=provider, model=DEFAULT_MODELS[provider])
@@ -231,6 +238,29 @@ class LLMRouter:
             },
             json={
                 "model": DEFAULT_MODELS["openai"],
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    async def _call_deepseek(self, client: httpx.AsyncClient, system: str, prompt: str) -> str:
+        # DeepSeek's API is OpenAI-compatible (same request/response shape,
+        # different base URL + model name), so this mirrors _call_openai
+        # exactly rather than needing its own wire format.
+        resp = await client.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self._keys['deepseek']}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": DEFAULT_MODELS["deepseek"],
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},

@@ -30,7 +30,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     gemini_api_key: str = ""
-    llm_provider_order: str = "anthropic,openai,gemini"
+    deep_seek_api_key: str = ""  # field name matches Railway's DEEP_SEEK_API_KEY env var
+    llm_provider_order: str = "anthropic,deepseek,openai,gemini"
 
     class Config:
         env_file = ".env"
