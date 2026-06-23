@@ -183,6 +183,79 @@ Most relevant past performance on file (use only these, do not invent others):
     }
 
 
+# ── /read-synthesis ──────────────────────────────────────────────────
+# R-E-A-D's six sections (eligibility, requirements, availability,
+# deadlines, economics, documentation) used to show the same generic
+# guidance copy no matter what solicitation a user was scoring — someone
+# could land on the worksheet straight from WARDOG and have no way to
+# know what THIS solicitation actually requires without leaving the page
+# to re-read it. This endpoint takes the real solicitation text (now
+# carried on the proposal row by WARDOG/FASS FILL) and returns one
+# grounded synthesis per section in a single call, so each question card
+# can show what the text actually says instead of a generic prompt.
+
+READ_CATEGORIES = {
+    "eligibility": "Registration & Eligibility — SAM.gov registration status, NAICS code match, and any set-aside qualification required.",
+    "requirements": "Experience & Mandatory Requirements — required licenses/certifications/bonds/clearances, and any other pass/fail mandatory qualification.",
+    "availability": "Availability & Capacity — staffing, equipment, and bandwidth needed to perform the work as described.",
+    "deadlines": "Deadlines & Timing — the response due date, performance start date, and period of performance.",
+    "economics": "Economics & Margin — pricing structure, contract value/ceiling if stated, and any cost risk implied by the scope.",
+    "documentation": "Documentation & Substantiation — required past performance references, key personnel, and technical approach content.",
+}
+
+READ_SYNTHESIS_SYSTEM_PROMPT = """You are a government contracts analyst helping a small business owner \
+quickly understand what a specific solicitation requires, section by section, before they answer a \
+bid/no-bid scoring worksheet. You will be given the solicitation's raw text and a list of six \
+categories. For EACH category, write a 2-3 sentence synthesis of what THIS solicitation specifically \
+says relevant to that category — cite concrete details from the text (specific certs, NAICS, dollar \
+figures, dates, named requirements) rather than generic advice. If the text does not address a \
+category at all, say so plainly (e.g. "The text doesn't specify staffing requirements — verify directly \
+with the contracting officer.") rather than inventing anything.
+
+Respond with ONLY a single JSON object mapping each category id to its synthesis string, with no prose \
+before or after it, e.g.:
+{"eligibility": "...", "requirements": "...", "availability": "...", "deadlines": "...", "economics": "...", "documentation": "..."}"""
+
+
+class ReadSynthesisRequest(BaseModel):
+    solicitation_text: str
+    title: str = ""
+    agency: str = ""
+
+
+@router.post("/read-synthesis")
+async def read_synthesis(body: ReadSynthesisRequest):
+    if not body.solicitation_text.strip():
+        raise HTTPException(status_code=400, detail="solicitation_text is required")
+
+    categories_block = "\n".join(f"- {cid}: {desc}" for cid, desc in READ_CATEGORIES.items())
+    prompt = f"""Solicitation: {body.title or '(untitled)'}{f' — {body.agency}' if body.agency else ''}
+
+Categories to synthesize:
+{categories_block}
+
+Solicitation text:
+{body.solicitation_text[:12000]}"""
+
+    try:
+        result = await llm_router.complete(system=READ_SYNTHESIS_SYSTEM_PROMPT, prompt=prompt)
+        synthesis = extract_json(result.text)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"Model returned unparseable output: {e}") from e
+
+    # Only return known category keys — drop anything hallucinated outside
+    # the requested set rather than passing it through to the frontend.
+    clean = {cid: synthesis.get(cid, "") for cid in READ_CATEGORIES if synthesis.get(cid)}
+
+    return {
+        "synthesis": clean,
+        "provider": result.provider,
+        "model": result.model,
+    }
+
+
 # ── /extract-from-image ──────────────────────────────────────────────
 # Continuity feature for WARDOG's "Other Sources" directory: FedConnect,
 # Unison Marketplace, and DIBBS sit behind vendor logins, so a server-side
