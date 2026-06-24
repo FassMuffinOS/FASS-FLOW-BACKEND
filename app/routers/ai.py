@@ -340,6 +340,117 @@ Scope of work text:
     }
 
 
+# ── /scope-takeoff ───────────────────────────────────────────────────
+# The Estimator's completeness assistant used to key off the proposal
+# TITLE with keyword rules — which hallucinates: "Fire & life safety
+# INSPECTION, testing and maintenance" matched "fire" and suggested
+# fire-rated CONSTRUCTION materials, when an inspection/maintenance
+# services contract installs no fire-rated walls at all. This endpoint
+# fixes that at the root: it reads the actual solicitation scope text,
+# classifies what KIND of job it is, and only proposes materials/
+# equipment/consumables consistent with that job type — grounded in the
+# text, never invented. The frontend shows the understood scope for the
+# user to confirm before anything is added.
+
+class ScopeTakeoffRequest(BaseModel):
+    scope_text: str
+    title: str = ""
+    agency: str = ""
+    naics_code: str = ""
+    user_id: str | None = None  # used only to enforce the Lite plan's quota
+
+
+SCOPE_TAKEOFF_SYSTEM_PROMPT = """You are a senior estimator helping a small government \
+contractor build a materials takeoff WITHOUT over-ordering things the job doesn't need. You \
+will be given a solicitation's scope text. Work in this exact order:
+
+1. CLASSIFY the job type from what the scope actually asks for. One of:
+   "inspection", "testing", "maintenance", "repair", "construction", "renovation",
+   "installation", "supply", "services", or "mixed".
+2. Only AFTER classifying, list supporting/auxiliary materials, equipment, and consumables \
+that THIS kind of job genuinely needs. The job type gates everything:
+   - inspection / testing: test instruments, tags/labels, forms & documentation, access \
+gear, minor consumables — NOT new construction materials.
+   - maintenance / repair: replacement parts, consumables, sealants/lubricants, small \
+quantities — sized to "as-needed", not full new installs.
+   - construction / renovation / installation: the real material line items, fasteners, \
+finishes, and the auxiliary items rookies forget (caulk, primer, waste).
+   - supply: the deliverable items themselves; little or no labor consumables.
+
+Return a SINGLE JSON object, no prose before or after it:
+{
+  "job_type": one of the strings above,
+  "job_type_reason": string,   // 1 sentence, cite what in the scope tells you this
+  "scope_summary": string,     // 2-3 plain sentences: what this job actually involves
+  "scope_items": [string],     // the discrete tasks/work the solicitation calls for
+  "materials": [
+    {
+      "name": string,          // specific item
+      "category": string,      // e.g. "Test equipment", "Consumables", "Fasteners"
+      "why": string,           // why this job needs it, grounded in the scope
+      "for_item": string,      // which scope task it supports
+      "qty_basis": string      // how to size it, e.g. "1 per device tested", "as-needed"
+    }
+  ],
+  "excluded": [string]         // categories you deliberately did NOT suggest and why, e.g. "No fire-rated construction materials — this is an inspection/maintenance contract, not new construction"
+}
+
+Hard rules: Do NOT suggest construction/installation materials for an inspection, testing, or \
+maintenance contract unless the scope explicitly calls for installing or replacing built \
+components. Do NOT invent quantities, site counts, or requirements not in the text. If the \
+scope is too vague to tell, set job_type to "services", keep materials minimal, and say so in \
+scope_summary. The "excluded" list is important — it's how the contractor sees what you ruled \
+out and why. Respond with ONLY the JSON object."""
+
+
+@router.post("/scope-takeoff")
+async def scope_takeoff(body: ScopeTakeoffRequest):
+    if not body.scope_text.strip():
+        raise HTTPException(status_code=400, detail="scope_text is required")
+    check_and_consume_ai_quota(body.user_id)
+
+    naics_line = f"NAICS: {body.naics_code}" if body.naics_code else "NAICS: not provided"
+    prompt = f"""Title: {body.title or '(untitled)'}
+Agency: {body.agency or '(not provided)'}
+{naics_line}
+
+Solicitation scope text:
+{body.scope_text[:12000]}"""
+
+    try:
+        result = await llm_router.complete(
+            system=SCOPE_TAKEOFF_SYSTEM_PROMPT, prompt=prompt, max_tokens=1800
+        )
+        fields = extract_json(result.text)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"Model returned unparseable output: {e}") from e
+
+    # Normalize: only keep well-formed material rows, never pass through junk.
+    materials = []
+    for m in (fields.get("materials") or []):
+        if isinstance(m, dict) and m.get("name"):
+            materials.append({
+                "name": str(m.get("name", "")),
+                "category": str(m.get("category", "")),
+                "why": str(m.get("why", "")),
+                "for_item": str(m.get("for_item", "")),
+                "qty_basis": str(m.get("qty_basis", "")),
+            })
+
+    return {
+        "job_type": fields.get("job_type", "services"),
+        "job_type_reason": fields.get("job_type_reason", ""),
+        "scope_summary": fields.get("scope_summary", ""),
+        "scope_items": [str(s) for s in (fields.get("scope_items") or [])],
+        "materials": materials,
+        "excluded": [str(s) for s in (fields.get("excluded") or [])],
+        "provider": result.provider,
+        "model": result.model,
+    }
+
+
 # ── /extract-from-image ──────────────────────────────────────────────
 # Continuity feature for WARDOG's "Other Sources" directory: FedConnect,
 # Unison Marketplace, and DIBBS sit behind vendor logins, so a server-side
