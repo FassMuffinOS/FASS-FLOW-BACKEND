@@ -115,6 +115,65 @@ async def create_wallet_checkout(body: CheckoutRequest):
     return {"url": session.url, "slug": slug}
 
 
+@router.get("/mine")
+async def get_my_wallet_pass(user_id: str = Query(..., min_length=1)):
+    """Lets Passport reload a user's existing card (design + purchase state)
+    on page load instead of starting from scratch every time — the whole
+    point of a "view your current card" experience instead of a one-shot
+    wizard. Returns the most recently created row for that user, or 404 if
+    they've never started a card."""
+    sb = get_supabase()
+    result = (
+        sb.table("wallet_passes")
+        .select(
+            "slug, business_name, address, naics, website, phone, purchased, "
+            "bg_color, logo_url, show_address, show_naics, show_phone, show_website"
+        )
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .maybe_single()
+        .execute()
+    )
+    record = result.data
+    if not record:
+        raise HTTPException(status_code=404, detail="No wallet card found for this user")
+    return record
+
+
+class CustomizeRequest(BaseModel):
+    slug: str
+    bg_color: str | None = None
+    logo_url: str | None = None
+    show_address: bool = True
+    show_naics: bool = True
+    show_phone: bool = True
+    show_website: bool = True
+
+
+@router.post("/customize")
+async def customize_wallet_pass(body: CustomizeRequest):
+    """Updates a card's design after the wallet_passes row already exists —
+    before OR after purchase. generate_pkpass() always reads bg_color/logo_url/
+    show_* fresh off the row at download time, so this is enough to change
+    the look of an already-purchased pass: just re-download /pass?slug=...
+    afterward to get the updated .pkpass. No Stripe involved here — design
+    changes stay free forever, only the original unlock was paywalled."""
+    sb = get_supabase()
+    update = {
+        "bg_color": body.bg_color or "#240e41",
+        "logo_url": body.logo_url,
+        "show_address": body.show_address,
+        "show_naics": body.show_naics,
+        "show_phone": body.show_phone,
+        "show_website": body.show_website,
+    }
+    result = sb.table("wallet_passes").update(update).eq("slug", body.slug).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="No wallet pass found for that slug")
+    return {"ok": True}
+
+
 @router.get("/purchase-status/{slug}")
 async def purchase_status(slug: str):
     sb = get_supabase()
