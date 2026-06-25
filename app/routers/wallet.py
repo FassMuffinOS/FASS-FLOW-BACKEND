@@ -65,8 +65,13 @@ class CheckoutRequest(BaseModel):
     phone: str | None = None
     # Card customization — free to design in Passport's preview, then
     # carried along here so the real signed .pkpass matches what the user
-    # actually designed instead of always using the default look.
+    # actually designed instead of always using the default look. bg_color
+    # is always a flat hex (the frontend resolves whatever preset is chosen
+    # down to a representative solid color, since Apple Wallet can't render
+    # gradients); card_style is the Canva-like preset id, kept only so the
+    # free preview can restore the same gradient/shimmer look on a revisit.
     bg_color: str | None = None
+    card_style: str | None = None
     logo_url: str | None = None
     show_address: bool = True
     show_naics: bool = True
@@ -92,6 +97,7 @@ async def create_wallet_checkout(body: CheckoutRequest):
         "phone": body.phone,
         "purchased": False,
         "bg_color": body.bg_color or "#240e41",
+        "card_style": body.card_style or "classic",
         "logo_url": body.logo_url,
         "show_address": body.show_address,
         "show_naics": body.show_naics,
@@ -127,7 +133,7 @@ async def get_my_wallet_pass(user_id: str = Query(..., min_length=1)):
         sb.table("wallet_passes")
         .select(
             "slug, business_name, address, naics, website, phone, purchased, "
-            "bg_color, logo_url, show_address, show_naics, show_phone, show_website"
+            "bg_color, card_style, logo_url, show_address, show_naics, show_phone, show_website"
         )
         .eq("user_id", user_id)
         .order("created_at", desc=True)
@@ -144,6 +150,7 @@ async def get_my_wallet_pass(user_id: str = Query(..., min_length=1)):
 class CustomizeRequest(BaseModel):
     slug: str
     bg_color: str | None = None
+    card_style: str | None = None
     logo_url: str | None = None
     show_address: bool = True
     show_naics: bool = True
@@ -162,6 +169,7 @@ async def customize_wallet_pass(body: CustomizeRequest):
     sb = get_supabase()
     update = {
         "bg_color": body.bg_color or "#240e41",
+        "card_style": body.card_style or "classic",
         "logo_url": body.logo_url,
         "show_address": body.show_address,
         "show_naics": body.show_naics,
@@ -193,7 +201,7 @@ async def get_public_pass(slug: str):
         sb.table("wallet_passes")
         .select(
             "business_name, address, naics, website, phone, purchased, "
-            "bg_color, logo_url, show_address, show_naics, show_phone, show_website"
+            "bg_color, card_style, logo_url, show_address, show_naics, show_phone, show_website"
         )
         .eq("slug", slug)
         .maybe_single()
