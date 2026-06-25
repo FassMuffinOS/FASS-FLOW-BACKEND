@@ -108,9 +108,16 @@ def build_pass_json(
     show_naics: bool = True,
     show_phone: bool = True,
     show_website: bool = True,
+    watermark: bool = False,
 ) -> dict:
     """Generic-style pass (membership/ID card layout) carrying a business's
     FASS Wallet info, with a QR code pointing at its public capability page.
+
+    watermark=True is the free-tier pass: real, signed, fully usable, but
+    it visibly says "Free" on the front and carries an upgrade pitch on the
+    back. Flips to False (and this disappears) the moment the row's
+    purchased flag goes true — no new pass needs to be issued, the next
+    /pass?slug=... download just renders without the watermark.
     """
     secondary_fields = []
     if address and show_address:
@@ -128,6 +135,12 @@ def build_pass_json(
         "label": "About FASS Wallet",
         "value": "Issued by FASS — verify this business and view its full capability statement by scanning the QR code.",
     })
+    if watermark:
+        back_fields.append({
+            "key": "upgrade",
+            "label": "Created with FASS — Free",
+            "value": "This is a free FASS Wallet card. Upgrade at flow.fass.systems/passport to remove this watermark and unlock the full premium card.",
+        })
 
     foreground_color, label_color = _contrast_colors(bg_color)
 
@@ -138,7 +151,7 @@ def build_pass_json(
         "serialNumber": serial_number,
         "organizationName": "FASS",
         "description": f"{business_name} — FASS Wallet Card",
-        "logoText": "FASS Wallet",
+        "logoText": "FASS Wallet · Free" if watermark else "FASS Wallet",
         "backgroundColor": _hex_to_rgb_string(bg_color),
         "foregroundColor": foreground_color,
         "labelColor": label_color,
@@ -214,6 +227,7 @@ def generate_pkpass(
     show_naics: bool = True,
     show_phone: bool = True,
     show_website: bool = True,
+    watermark: bool = False,
 ) -> bytes:
     """Returns the raw bytes of a signed .pkpass file."""
     if not apple_wallet_configured():
@@ -235,6 +249,7 @@ def generate_pkpass(
         show_naics=show_naics,
         show_phone=show_phone,
         show_website=show_website,
+        watermark=watermark,
     )
     pass_json_bytes = json.dumps(pass_dict, separators=(",", ":")).encode("utf-8")
 
