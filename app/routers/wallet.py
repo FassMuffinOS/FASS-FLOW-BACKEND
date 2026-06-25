@@ -63,6 +63,15 @@ class CheckoutRequest(BaseModel):
     naics: str | None = None
     website: str | None = None
     phone: str | None = None
+    # Card customization — free to design in Passport's preview, then
+    # carried along here so the real signed .pkpass matches what the user
+    # actually designed instead of always using the default look.
+    bg_color: str | None = None
+    logo_url: str | None = None
+    show_address: bool = True
+    show_naics: bool = True
+    show_phone: bool = True
+    show_website: bool = True
 
 
 @router.post("/checkout")
@@ -82,6 +91,12 @@ async def create_wallet_checkout(body: CheckoutRequest):
         "website": body.website,
         "phone": body.phone,
         "purchased": False,
+        "bg_color": body.bg_color or "#240e41",
+        "logo_url": body.logo_url,
+        "show_address": body.show_address,
+        "show_naics": body.show_naics,
+        "show_phone": body.show_phone,
+        "show_website": body.show_website,
     }
     sb.table("wallet_passes").insert(row).execute()
 
@@ -117,7 +132,10 @@ async def get_public_pass(slug: str):
     sb = get_supabase()
     result = (
         sb.table("wallet_passes")
-        .select("business_name, address, naics, website, phone, purchased")
+        .select(
+            "business_name, address, naics, website, phone, purchased, "
+            "bg_color, logo_url, show_address, show_naics, show_phone, show_website"
+        )
         .eq("slug", slug)
         .maybe_single()
         .execute()
@@ -152,6 +170,12 @@ async def get_pass(slug: str = Query(..., min_length=1)):
             phone=record.get("phone"),
             barcode_url=barcode_url,
             serial_number=slug,
+            bg_color=record.get("bg_color"),
+            logo_url=record.get("logo_url"),
+            show_address=record.get("show_address", True),
+            show_naics=record.get("show_naics", True),
+            show_phone=record.get("show_phone", True),
+            show_website=record.get("show_website", True),
         )
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

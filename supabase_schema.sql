@@ -124,3 +124,33 @@ create policy "Users can manage own wallet passes"
   on public.wallet_passes for all using (auth.uid() = user_id);
 
 create index if not exists wallet_passes_slug_idx on public.wallet_passes(slug);
+
+-- ── FASS Wallet card customization ────────────────────────────────────
+-- Free to design in the preview, before any purchase exists — these ride
+-- along on the same wallet_passes row created at checkout time, then
+-- generate_pkpass() (applewallet.py) reads them back to brand the real,
+-- signed pass. bg_color is a hex string ("#240e41"); logo_url points into
+-- the public wallet-logos storage bucket below.
+alter table public.wallet_passes add column if not exists bg_color text not null default '#240e41';
+alter table public.wallet_passes add column if not exists logo_url text;
+alter table public.wallet_passes add column if not exists show_address boolean not null default true;
+alter table public.wallet_passes add column if not exists show_naics boolean not null default true;
+alter table public.wallet_passes add column if not exists show_phone boolean not null default true;
+alter table public.wallet_passes add column if not exists show_website boolean not null default true;
+
+-- ── FASS Wallet logo uploads (Storage bucket) ─────────────────────────
+-- Public read so logos can be embedded in a downloaded .pkpass and on the
+-- public /c/{slug} capability page; insert restricted to authenticated
+-- users uploading their own logo from Passport's customization step.
+insert into storage.buckets (id, name, public)
+values ('wallet-logos', 'wallet-logos', true)
+on conflict (id) do nothing;
+
+create policy "Public read wallet logos"
+  on storage.objects for select
+  using (bucket_id = 'wallet-logos');
+
+create policy "Authenticated users can upload wallet logos"
+  on storage.objects for insert
+  to authenticated
+  with check (bucket_id = 'wallet-logos');
