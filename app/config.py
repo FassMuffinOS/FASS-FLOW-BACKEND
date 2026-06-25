@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me"
     admin_secret: str = ""  # required to use /admin/* routes; set in Railway, never commit
     sam_gov_api_key: str = ""  # SAM.gov opportunities API key; set in Railway, never commit
+    google_places_api_key: str = ""  # Google Places API (New); set in Railway, never commit
 
     # AI providers — all optional. The LLM router skips any provider
     # whose key is blank and falls through to the next one in order.

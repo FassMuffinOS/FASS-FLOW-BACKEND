@@ -67,6 +67,7 @@ See `.env.example` for the full list. Summary:
 | `STRIPE_WEBHOOK_SECRET` | Yes | Stripe webhook signing secret, used by the live handler at `/api/v1/subscriptions/webhook` |
 | `STRIPE_PRICE_LITE` / `STRIPE_PRICE_STARTER` / `STRIPE_PRICE_PRO` / `STRIPE_PRICE_TEAM` | No | Stripe Price IDs for each tiered plan |
 | `SAM_GOV_API_KEY` | No | SAM.gov opportunities API key. Without it, `/api/v1/wardog/search` returns 503 and the frontend falls back to sample data. |
+| `GOOGLE_PLACES_API_KEY` | No | Google Places API (New) server key, used by `/api/v1/business/lookup` for the Passport "Find my business" search. Requires a Google Cloud project with billing enabled and "Places API (New)" turned on; restrict the key to server IPs, not HTTP referrers, since it's only ever called from this backend. Without it, the endpoint returns 503 and Passport's quick-setup falls back to manual entry. |
 | `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Yes | Upstash Redis REST credentials |
 | `FRONTEND_URL` | No | Used for CORS; defaults to local dev |
 | `JWT_SECRET` | Yes | Used for any locally-issued tokens |
