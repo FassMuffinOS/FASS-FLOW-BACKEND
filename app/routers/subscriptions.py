@@ -15,6 +15,20 @@ PLAN_PRICE_MAP = {
     "pro":     settings.stripe_price_pro,
     "team":    settings.stripe_price_team,
 }
+# Reverse lookup so subscription.created/updated events — which carry a
+# Stripe price ID on the subscription item, not our plan name — can be
+# mapped back to the plan tier without re-deriving it from checkout
+# session metadata (which isn't present on these event types at all).
+PRICE_TO_PLAN_MAP = {v: k for k, v in PLAN_PRICE_MAP.items() if v}
+
+
+def _plan_from_subscription(sub) -> str | None:
+    items = (sub.get("items") or {}).get("data") or []
+    for item in items:
+        price_id = (item.get("price") or {}).get("id")
+        if price_id in PRICE_TO_PLAN_MAP:
+            return PRICE_TO_PLAN_MAP[price_id]
+    return None
 
 
 class CheckoutRequest(BaseModel):
@@ -77,6 +91,23 @@ async def stripe_webhook(
         (
             sb.table("profiles")
             .update({"subscription_status": "cancelled", "plan": "free"})
+            .eq("stripe_subscription_id", sub["id"])
+            .execute()
+        )
+
+    elif event["type"] in ("customer.subscription.created", "customer.subscription.updated"):
+        # Covers plan changes made through the customer billing portal
+        # (upgrade/downgrade, pause, reactivation) — these never hit
+        # checkout.session.completed and previously left profiles.plan
+        # stale until the next invoice event happened to fire.
+        sub = event["data"]["object"]
+        update = {"subscription_status": sub.get("status", "active")}
+        plan = _plan_from_subscription(sub)
+        if plan:
+            update["plan"] = plan
+        (
+            sb.table("profiles")
+            .update(update)
             .eq("stripe_subscription_id", sub["id"])
             .execute()
         )
