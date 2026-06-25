@@ -96,3 +96,31 @@ alter table public.profiles add column if not exists admin_note text;
 -- starts null so the first AI call on a profile initializes the cycle.
 alter table public.profiles add column if not exists ai_quota_used integer not null default 0;
 alter table public.profiles add column if not exists ai_quota_reset_at timestamptz;
+
+-- ── FASS Wallet (.pkpass) one-time purchases ──────────────────────────
+-- Free preview renders client-side from business_lookup.py's result with
+-- no row here at all. A row is only created once someone clicks "Unlock &
+-- add to Apple Wallet" — it tracks the one-time Stripe payment for a real,
+-- signed .pkpass tied to one business. slug is the public QR target
+-- (flow.fass.systems/c/{slug}) and the lookup key wallet.py's /pass and
+-- /purchase-status endpoints use; it never changes once created.
+create table if not exists public.wallet_passes (
+  id                 uuid primary key default uuid_generate_v4(),
+  user_id            uuid references public.profiles(id) on delete cascade,
+  slug               text unique not null,
+  business_name      text not null,
+  address            text,
+  naics              text,
+  website            text,
+  phone              text,
+  stripe_session_id  text,
+  purchased          boolean not null default false,
+  purchased_at       timestamptz,
+  created_at         timestamptz not null default now()
+);
+
+alter table public.wallet_passes enable row level security;
+create policy "Users can manage own wallet passes"
+  on public.wallet_passes for all using (auth.uid() = user_id);
+
+create index if not exists wallet_passes_slug_idx on public.wallet_passes(slug);

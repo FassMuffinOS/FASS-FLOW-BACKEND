@@ -73,16 +73,33 @@ See `.env.example` for the full list. Summary:
 | `JWT_SECRET` | Yes | Used for any locally-issued tokens |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | No | Optional — AI endpoints no-op without at least one |
 | `LLM_PROVIDER_ORDER` | No | Comma-separated fallback order for the above |
+| `APPLE_PASS_CERT_PEM_B64` / `APPLE_PASS_KEY_PEM_B64` / `APPLE_WWDR_PEM_B64` | No | Base64-encoded PEM blobs for the Apple Pass Type ID certificate, its matching private key, and the Apple WWDR intermediate certificate. Used by `/api/v1/wallet/pass` to sign real `.pkpass` files. Without all three set, `/api/v1/wallet/status` reports `configured: false` and `/api/v1/wallet/pass` returns 503. |
+| `APPLE_PASS_KEY_PASSWORD` | No | Only needed if the private key above is password-protected; this deployment's key was exported unencrypted, so it's unset |
+| `APPLE_TEAM_ID` | No | 10-character Apple Developer Team ID, required alongside the certs above |
+| `APPLE_PASS_TYPE_ID` | No | The registered Pass Type ID, e.g. `pass.systems.fass.wallet` |
+| `STRIPE_PRICE_WALLET` | No | One-time Stripe Price ID for unlocking a real FASS Wallet `.pkpass` (mode="payment", not a subscription). Without it, `POST /api/v1/wallet/checkout` returns 503 and Passport only offers the free preview card. |
 
 ## What is real now
 
 - FastAPI app deployed on Railway, with `auth`, `subscriptions`, `users`,
-  `ai`, `admin`, `wardog`, and `network` routers mounted under `/api/v1`
+  `ai`, `admin`, `wardog`, `network`, `business_lookup`, and `wallet` routers
+  mounted under `/api/v1`
 - `/api/v1/wardog/search` — live SAM.gov opportunities proxy consumed by the
   frontend's WARDOG page
 - Stripe Checkout + customer portal + webhook handler covering the full
   subscription lifecycle (created/updated/deleted, invoice payment events),
   syncing plan/status to `profiles` in Supabase
+- FASS Wallet: real, signed Apple `.pkpass` generation (`/api/v1/wallet/pass`)
+  gated by a one-time Stripe Checkout (`/api/v1/wallet/checkout`, mode=
+  "payment"). The shared webhook handler flips `wallet_passes.purchased` on
+  `checkout.session.completed` when the session metadata's `kind` is
+  `wallet_pass`; `/api/v1/wallet/pass` refuses to sign anything for a slug
+  until that flag is true. The free preview card on Passport renders
+  entirely client-side from `business_lookup.py`'s result, with no row or
+  cert material involved at all. Every signed pass's QR code points at
+  `/api/v1/wallet/public/{slug}` (no auth, marketing-safe fields only),
+  rendered by the frontend's public `/c/{slug}` page — that's the page
+  whoever scans the physical card actually lands on
 - LLM router with provider fallback (Anthropic → DeepSeek → OpenAI →
   Gemini), raw HTTP, no SDK lock-in
 - Lightweight pure-Python TF-IDF retrieval for ranking a user's past

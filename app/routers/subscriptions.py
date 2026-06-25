@@ -1,4 +1,6 @@
 """Stripe subscription routes."""
+from datetime import datetime, timezone
+
 import stripe
 from fastapi import APIRouter, HTTPException, Request, Header
 from pydantic import BaseModel
@@ -73,18 +75,34 @@ async def stripe_webhook(
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        user_id = session["metadata"]["user_id"]
-        plan = session["metadata"]["plan"]
-        customer_id = session["customer"]
-        subscription_id = session["subscription"]
+        metadata = session.get("metadata") or {}
 
-        sb.table("profiles").upsert({
-            "id": user_id,
-            "stripe_customer_id": customer_id,
-            "stripe_subscription_id": subscription_id,
-            "plan": plan,
-            "subscription_status": "active",
-        }).execute()
+        if metadata.get("kind") == "wallet_pass":
+            # One-time FASS Wallet .pkpass unlock — mode="payment", no
+            # subscription/customer record to sync, just flip the purchased
+            # flag on the slug's row so GET /wallet/pass will serve the
+            # real signed file from here on.
+            slug = metadata.get("slug")
+            if slug:
+                (
+                    sb.table("wallet_passes")
+                    .update({"purchased": True, "purchased_at": datetime.now(timezone.utc).isoformat()})
+                    .eq("slug", slug)
+                    .execute()
+                )
+        else:
+            user_id = metadata["user_id"]
+            plan = metadata["plan"]
+            customer_id = session["customer"]
+            subscription_id = session["subscription"]
+
+            sb.table("profiles").upsert({
+                "id": user_id,
+                "stripe_customer_id": customer_id,
+                "stripe_subscription_id": subscription_id,
+                "plan": plan,
+                "subscription_status": "active",
+            }).execute()
 
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
