@@ -22,6 +22,12 @@ Flow:
   5. POST /rewards/stamp — business adds (or removes, via negative delta) a
      stamp on a specific customer's card. Ownership-checked against
      business_user_id so only the program's own owner can stamp it.
+  6. POST /rewards/redeem — the actual payoff: once a card's stamps reach
+     the program's threshold, the business taps Redeem (after physically
+     handing over the free item), which carries any extra stamps forward,
+     bumps redeemed_count, and logs a row in reward_redemptions. Before
+     this existed, stamps just counted up forever with no closing action —
+     "REWARD READY!" on the pass had nothing behind it.
 """
 import re
 import uuid
@@ -83,7 +89,7 @@ async def get_my_program(user_id: str = Query(..., min_length=1)):
 
     cards = (
         sb.table("reward_cards")
-        .select("slug, customer_name, stamps, created_at, updated_at")
+        .select("slug, customer_name, stamps, redeemed_count, created_at, updated_at")
         .eq("business_user_id", user_id)
         .order("updated_at", desc=True)
         .execute()
@@ -147,6 +153,57 @@ async def add_stamp(body: StampRequest):
     new_stamps = max(0, card["stamps"] + body.delta)
     sb.table("reward_cards").update({"stamps": new_stamps}).eq("slug", body.slug).execute()
     return {"slug": body.slug, "stamps": new_stamps}
+
+
+class RedeemRequest(BaseModel):
+    slug: str
+    business_user_id: str
+
+
+@router.post("/redeem")
+async def redeem_reward(body: RedeemRequest):
+    """The business confirms they've handed over the free item. Resets the
+    card by subtracting the threshold (not zeroing outright) so any stamps
+    earned past the threshold carry forward into the next round instead of
+    being thrown away, bumps redeemed_count for the business's own loyalty
+    insight, and logs an audit row in reward_redemptions."""
+    sb = get_supabase()
+    card = single_data(
+        sb.table("reward_cards")
+        .select("stamps, redeemed_count, business_user_id")
+        .eq("slug", body.slug)
+        .maybe_single()
+        .execute()
+    )
+    if not card:
+        raise HTTPException(status_code=404, detail="No rewards card found for that link")
+    if card["business_user_id"] != body.business_user_id:
+        raise HTTPException(status_code=403, detail="This card belongs to a different business")
+
+    program = single_data(
+        sb.table("reward_programs")
+        .select("reward_threshold")
+        .eq("business_user_id", body.business_user_id)
+        .maybe_single()
+        .execute()
+    )
+    threshold = (program or {}).get("reward_threshold", 10)
+    if card["stamps"] < threshold:
+        raise HTTPException(status_code=400, detail=f"Card has {card['stamps']} of {threshold} stamps — not ready to redeem yet")
+
+    new_stamps = card["stamps"] - threshold
+    new_redeemed_count = (card.get("redeemed_count") or 0) + 1
+    sb.table("reward_cards").update({
+        "stamps": new_stamps,
+        "redeemed_count": new_redeemed_count,
+    }).eq("slug", body.slug).execute()
+    sb.table("reward_redemptions").insert({
+        "card_slug": body.slug,
+        "business_user_id": body.business_user_id,
+        "stamps_at_redemption": card["stamps"],
+    }).execute()
+
+    return {"slug": body.slug, "stamps": new_stamps, "redeemed_count": new_redeemed_count}
 
 
 @router.get("/pass")
