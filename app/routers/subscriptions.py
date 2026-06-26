@@ -90,6 +90,23 @@ async def stripe_webhook(
                     .eq("slug", slug)
                     .execute()
                 )
+        elif metadata.get("kind") == "gift_card":
+            # Public storefront gift card purchase — mode="payment" with a
+            # customer-chosen amount (see gift_cards.py's /purchase/checkout).
+            # No gift_cards row exists yet; this webhook is what actually
+            # creates it, only now that payment is confirmed. Upserted on
+            # slug since Stripe can redeliver the same event more than once.
+            slug = metadata.get("slug")
+            value = float(metadata.get("value") or 0)
+            if slug and value > 0:
+                sb.table("gift_cards").upsert({
+                    "slug": slug,
+                    "business_user_id": metadata.get("business_user_id"),
+                    "customer_name": metadata.get("customer_name") or None,
+                    "customer_contact": metadata.get("customer_contact") or None,
+                    "original_value": value,
+                    "balance": value,
+                }, on_conflict="slug").execute()
         else:
             user_id = metadata["user_id"]
             plan = metadata["plan"]
