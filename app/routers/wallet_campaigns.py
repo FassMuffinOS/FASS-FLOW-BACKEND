@@ -66,14 +66,18 @@ class CreateCampaignRequest(BaseModel):
     expires_at: str | None = None
     repeat_use: bool = False
     estimated_value: float | None = None
+    target_slugs: list[str] | None = None  # if given/non-empty, scope the send
+    # to just these reward_cards.slug values instead of every card the
+    # business has issued — backs the customer list's targeted/segmented send.
 
 
 @router.post("")
 async def create_and_send_campaign(body: CreateCampaignRequest):
-    """Creates the campaign, then immediately broadcasts it onto every
-    customer card this business has issued — there's no separate
-    'draft then send' step in the MVP, matching the one-way-broadcast
-    spec (write an offer, it goes out)."""
+    """Creates the campaign, then immediately broadcasts it onto either every
+    customer card this business has issued, or — if target_slugs is set —
+    just that selected subset. There's no separate 'draft then send' step in
+    the MVP, matching the one-way-broadcast spec (write an offer, it goes
+    out, optionally to a chosen segment)."""
     sb = get_supabase()
     row = {
         "business_user_id": body.business_user_id,
@@ -102,12 +106,11 @@ async def create_and_send_campaign(body: CreateCampaignRequest):
     if not campaign:
         raise HTTPException(status_code=500, detail="Campaign was created but could not be re-read")
 
-    cards = (
-        sb.table("reward_cards")
-        .select("slug")
-        .eq("business_user_id", body.business_user_id)
-        .execute()
-    ).data or []
+    cards_query = sb.table("reward_cards").select("slug").eq("business_user_id", body.business_user_id)
+    target_slugs = [s for s in (body.target_slugs or []) if s]
+    if target_slugs:
+        cards_query = cards_query.in_("slug", target_slugs)
+    cards = cards_query.execute().data or []
 
     for c in cards:
         sb.table("reward_cards").update({"active_campaign_id": campaign["id"]}).eq("slug", c["slug"]).execute()
@@ -130,9 +133,43 @@ async def list_my_campaigns(user_id: str = Query(..., min_length=1)):
         .execute()
     ).data or []
 
-    customer_count = len(
-        (sb.table("reward_cards").select("slug").eq("business_user_id", user_id).execute()).data or []
-    )
+    cards = (
+        sb.table("reward_cards")
+        .select("slug, customer_name, customer_contact, stamps, redeemed_count, active_campaign_id, created_at, updated_at")
+        .eq("business_user_id", user_id)
+        .order("updated_at", desc=True)
+        .execute()
+    ).data or []
+
+    # Per-customer redemption totals across ALL campaigns, in one query
+    # rather than N — used below to show each customer's lifetime offer
+    # redemptions on the contacts list, the data that makes the list a
+    # tool (who's engaged, who's gone quiet) rather than just a head count.
+    redemptions = (
+        sb.table("wallet_campaign_redemptions")
+        .select("card_slug")
+        .eq("business_user_id", user_id)
+        .execute()
+    ).data or []
+    redemptions_by_slug: dict[str, int] = {}
+    for r in redemptions:
+        redemptions_by_slug[r["card_slug"]] = redemptions_by_slug.get(r["card_slug"], 0) + 1
+
+    customers = [
+        {
+            "slug": c["slug"],
+            "customer_name": c.get("customer_name"),
+            "customer_contact": c.get("customer_contact"),
+            "stamps": c.get("stamps") or 0,
+            "redeemed_count": c.get("redeemed_count") or 0,
+            "offer_redemptions": redemptions_by_slug.get(c["slug"], 0),
+            "has_active_offer": bool(c.get("active_campaign_id")),
+            "created_at": c.get("created_at"),
+            "updated_at": c.get("updated_at"),
+        }
+        for c in cards
+    ]
+    customer_count = len(cards)
 
     results = []
     for c in campaigns:
@@ -148,7 +185,7 @@ async def list_my_campaigns(user_id: str = Query(..., min_length=1)):
         revenue_estimate = (c.get("estimated_value") or 0) * redeemed
         results.append({**c, "redeemed_count": redeemed, "revenue_estimate": revenue_estimate})
 
-    return {"campaigns": results, "customer_count": customer_count}
+    return {"campaigns": results, "customer_count": customer_count, "customers": customers}
 
 
 class RedeemCampaignRequest(BaseModel):
