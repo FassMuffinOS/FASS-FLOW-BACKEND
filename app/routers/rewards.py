@@ -37,6 +37,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.database import get_supabase, single_data
+from app.services.apns import notify_devices
 from app.services.applewallet import apple_wallet_configured, generate_storecard_pkpass
 
 router = APIRouter(prefix="/rewards", tags=["rewards"])
@@ -152,6 +153,9 @@ async def add_stamp(body: StampRequest):
 
     new_stamps = max(0, card["stamps"] + body.delta)
     sb.table("reward_cards").update({"stamps": new_stamps}).eq("slug", body.slug).execute()
+    # Silently push any device that already has this card in Wallet so the
+    # new stamp count shows up without the customer re-downloading anything.
+    notify_devices(sb, body.slug)
     return {"slug": body.slug, "stamps": new_stamps}
 
 
@@ -202,6 +206,7 @@ async def redeem_reward(body: RedeemRequest):
         "business_user_id": body.business_user_id,
         "stamps_at_redemption": card["stamps"],
     }).execute()
+    notify_devices(sb, body.slug)
 
     return {"slug": body.slug, "stamps": new_stamps, "redeemed_count": new_redeemed_count}
 

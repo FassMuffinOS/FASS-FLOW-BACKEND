@@ -38,6 +38,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.database import get_supabase, single_data
+from app.services.apns import notify_devices
 from app.services.applewallet import apple_wallet_configured, generate_pkpass
 
 stripe.api_key = settings.stripe_secret_key
@@ -258,6 +259,9 @@ async def customize_wallet_pass(body: CustomizeRequest):
     result = sb.table("wallet_passes").update(update).eq("slug", body.slug).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="No wallet pass found for that slug")
+    # Silently push any device that already has this card in Wallet so the
+    # new design shows up without the customer re-downloading anything.
+    notify_devices(sb, body.slug)
     return {"ok": True}
 
 

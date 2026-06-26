@@ -15,6 +15,7 @@ A .pkpass file is just a zip archive containing:
 """
 import base64
 import hashlib
+import hmac
 import json
 import subprocess
 import tempfile
@@ -90,6 +91,18 @@ def apple_wallet_configured() -> bool:
     )
 
 
+def push_auth_token(serial_number: str) -> str:
+    """Stateless per-pass PassKit auth token: HMAC-SHA256(secret, serial)
+    instead of a random per-row secret stored in the DB — avoids a schema
+    migration entirely, since serial_number (== slug) is already the unique
+    key on both wallet_passes and reward_cards. Embedded in pass.json's
+    authenticationToken field at issue time, and re-derived (never stored)
+    by wallet_passkit.py to validate the 'Authorization: ApplePass <token>'
+    header Apple Wallet sends on every device-originated call."""
+    secret = settings.wallet_auth_secret or settings.jwt_secret
+    return hmac.new(secret.encode(), serial_number.encode(), hashlib.sha256).hexdigest()
+
+
 def _decode(b64_value: str) -> bytes:
     """Decodes a base64 env var. Tolerates the two most common copy/paste
     mangling issues with Railway (or any dashboard) env var fields: stray
@@ -153,7 +166,7 @@ def build_pass_json(
 
     foreground_color, label_color = _contrast_colors(bg_color)
 
-    return {
+    pass_dict = {
         "formatVersion": 1,
         "passTypeIdentifier": settings.apple_pass_type_id,
         "teamIdentifier": settings.apple_team_id,
@@ -179,6 +192,13 @@ def build_pass_json(
             }
         ],
     }
+    # Live push — only added once backend_base_url is set in Railway, so
+    # turning push on/off never requires re-issuing already-downloaded
+    # passes; Wallet simply won't have a webServiceURL to call until then.
+    if settings.backend_base_url:
+        pass_dict["webServiceURL"] = f"{settings.backend_base_url}/api/v1/passkit"
+        pass_dict["authenticationToken"] = push_auth_token(serial_number)
+    return pass_dict
 
 
 def build_storecard_pass_json(
@@ -203,7 +223,7 @@ def build_storecard_pass_json(
     foreground_color, label_color = _contrast_colors(bg_color)
     earned = stamps >= reward_threshold
 
-    return {
+    pass_dict = {
         "formatVersion": 1,
         "passTypeIdentifier": settings.apple_pass_type_id,
         "teamIdentifier": settings.apple_team_id,
@@ -246,6 +266,10 @@ def build_storecard_pass_json(
             }
         ],
     }
+    if settings.backend_base_url:
+        pass_dict["webServiceURL"] = f"{settings.backend_base_url}/api/v1/passkit"
+        pass_dict["authenticationToken"] = push_auth_token(serial_number)
+    return pass_dict
 
 
 def _sha1_hex(data: bytes) -> str:

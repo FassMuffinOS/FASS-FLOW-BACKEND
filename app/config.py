@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     apple_team_id: str = ""             # 10-char Apple Developer Team ID
     apple_pass_type_id: str = ""        # e.g. pass.systems.fass.wallet
 
+    # Apple PassKit Web Service / APNs live push — lets an already-issued
+    # pass update itself in place (new stamp, redeemed reward, re-customized
+    # card) instead of needing a manual re-download. Blank backend_base_url
+    # keeps the old behavior exactly (no webServiceURL on the pass at all,
+    # so Wallet never even tries to call home) — set it once the backend's
+    # public HTTPS URL is known (e.g. https://api.flow.fass.systems).
+    backend_base_url: str = ""
+    wallet_auth_secret: str = ""  # falls back to jwt_secret if blank
+
     # AI providers — all optional. The LLM router skips any provider
     # whose key is blank and falls through to the next one in order.
     anthropic_api_key: str = ""
