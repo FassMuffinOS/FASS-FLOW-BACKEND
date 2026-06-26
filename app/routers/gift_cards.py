@@ -31,6 +31,12 @@ the actual gift_cards row only once payment is confirmed — no card exists
 in the database before that webhook fires. GET /purchase/status lets the
 post-checkout confirmation page poll for that row to appear, same idea as
 wallet.py's /purchase-status/{slug}.
+
+If the business has completed Stripe Connect onboarding (stripe_connect.py),
+/purchase/checkout routes the payment directly to their own connected
+account via a destination charge instead of FASS Flow's master account —
+no platform fee is taken on this yet. Businesses who haven't onboarded keep
+working exactly as before.
 """
 import re
 import uuid
@@ -267,7 +273,7 @@ async def create_gift_card_checkout(body: CreateGiftCardCheckoutRequest):
     # who abandons checkout never ends up with a "free" balance.
     slug = _slugify(business_name)
 
-    session = stripe.checkout.Session.create(
+    session_kwargs = dict(
         mode="payment",
         payment_method_types=["card"],
         line_items=[{
@@ -290,6 +296,27 @@ async def create_gift_card_checkout(body: CreateGiftCardCheckoutRequest):
         success_url=f"{settings.frontend_url}/giftcards/buy/{body.business_user_id}?success=1&slug={slug}",
         cancel_url=f"{settings.frontend_url}/giftcards/buy/{body.business_user_id}?cancelled=1",
     )
+
+    # If this business has finished Stripe Connect onboarding (see
+    # stripe_connect.py), send the payment straight to their own connected
+    # account instead of FASS Flow's master account — a "destination
+    # charge." No platform fee is taken here; that's a separate business
+    # decision for later, not something to silently add now. Businesses
+    # who haven't onboarded yet keep working exactly as before, with the
+    # money landing in the platform account until they do.
+    profile = single_data(
+        sb.table("business_profiles")
+        .select("stripe_connect_account_id, connect_payouts_enabled")
+        .eq("user_id", body.business_user_id)
+        .maybe_single()
+        .execute()
+    ) or {}
+    if profile.get("connect_payouts_enabled") and profile.get("stripe_connect_account_id"):
+        session_kwargs["payment_intent_data"] = {
+            "transfer_data": {"destination": profile["stripe_connect_account_id"]},
+        }
+
+    session = stripe.checkout.Session.create(**session_kwargs)
     return {"url": session.url, "slug": slug}
 
 
