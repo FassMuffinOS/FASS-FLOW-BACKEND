@@ -37,7 +37,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.config import settings
-from app.database import get_supabase
+from app.database import get_supabase, single_data
 from app.services.applewallet import apple_wallet_configured, generate_pkpass
 
 stripe.api_key = settings.stripe_secret_key
@@ -108,14 +108,14 @@ async def create_wallet_checkout(body: CheckoutRequest):
 
     existing = None
     if body.slug:
-        existing = (
+        existing = single_data(
             sb.table("wallet_passes")
             .select("slug")
             .eq("slug", body.slug)
             .eq("user_id", body.user_id)
             .maybe_single()
             .execute()
-        ).data
+        )
 
     if existing:
         slug = body.slug
@@ -209,7 +209,7 @@ async def get_my_wallet_pass(user_id: str = Query(..., min_length=1)):
     wizard. Returns the most recently created row for that user, or 404 if
     they've never started a card."""
     sb = get_supabase()
-    result = (
+    record = single_data(
         sb.table("wallet_passes")
         .select(
             "slug, business_name, address, naics, website, phone, purchased, "
@@ -221,7 +221,6 @@ async def get_my_wallet_pass(user_id: str = Query(..., min_length=1)):
         .maybe_single()
         .execute()
     )
-    record = result.data
     if not record:
         raise HTTPException(status_code=404, detail="No wallet card found for this user")
     return record
@@ -265,10 +264,10 @@ async def customize_wallet_pass(body: CustomizeRequest):
 @router.get("/purchase-status/{slug}")
 async def purchase_status(slug: str):
     sb = get_supabase()
-    result = sb.table("wallet_passes").select("purchased").eq("slug", slug).maybe_single().execute()
-    if not result.data:
+    record = single_data(sb.table("wallet_passes").select("purchased").eq("slug", slug).maybe_single().execute())
+    if not record:
         raise HTTPException(status_code=404, detail="No wallet pass found for that slug")
-    return {"purchased": bool(result.data["purchased"])}
+    return {"purchased": bool(record["purchased"])}
 
 
 @router.get("/public/{slug}")
@@ -277,7 +276,7 @@ async def get_public_pass(slug: str):
     no purchased gate — a pass that was never purchased simply doesn't
     have a row, and that 404s the same as a bad slug."""
     sb = get_supabase()
-    result = (
+    record = single_data(
         sb.table("wallet_passes")
         .select(
             "business_name, address, naics, website, phone, purchased, "
@@ -287,7 +286,6 @@ async def get_public_pass(slug: str):
         .maybe_single()
         .execute()
     )
-    record = result.data
     if not record:
         raise HTTPException(status_code=404, detail="No business found for that link")
     return record
@@ -299,8 +297,7 @@ async def get_pass(slug: str = Query(..., min_length=1)):
         raise HTTPException(status_code=503, detail="Apple Wallet not configured")
 
     sb = get_supabase()
-    result = sb.table("wallet_passes").select("*").eq("slug", slug).maybe_single().execute()
-    record = result.data
+    record = single_data(sb.table("wallet_passes").select("*").eq("slug", slug).maybe_single().execute())
     if not record:
         raise HTTPException(status_code=404, detail="No wallet pass found for that slug")
 

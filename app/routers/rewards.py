@@ -30,7 +30,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.database import get_supabase
+from app.database import get_supabase, single_data
 from app.services.applewallet import apple_wallet_configured, generate_storecard_pkpass
 
 router = APIRouter(prefix="/rewards", tags=["rewards"])
@@ -71,13 +71,13 @@ async def upsert_program(body: ProgramRequest):
 @router.get("/program/mine")
 async def get_my_program(user_id: str = Query(..., min_length=1)):
     sb = get_supabase()
-    program = (
+    program = single_data(
         sb.table("reward_programs")
         .select("*")
         .eq("business_user_id", user_id)
         .maybe_single()
         .execute()
-    ).data
+    )
     if not program:
         raise HTTPException(status_code=404, detail="No rewards program set up yet")
 
@@ -101,13 +101,13 @@ class JoinRequest(BaseModel):
 @router.post("/join")
 async def join_program(body: JoinRequest):
     sb = get_supabase()
-    program = (
+    program = single_data(
         sb.table("reward_programs")
         .select("business_name")
         .eq("business_user_id", body.business_user_id)
         .maybe_single()
         .execute()
-    ).data
+    )
     if not program:
         raise HTTPException(status_code=404, detail="That business hasn't set up a rewards program")
 
@@ -132,13 +132,13 @@ class StampRequest(BaseModel):
 @router.post("/stamp")
 async def add_stamp(body: StampRequest):
     sb = get_supabase()
-    card = (
+    card = single_data(
         sb.table("reward_cards")
         .select("stamps, business_user_id")
         .eq("slug", body.slug)
         .maybe_single()
         .execute()
-    ).data
+    )
     if not card:
         raise HTTPException(status_code=404, detail="No rewards card found for that link")
     if card["business_user_id"] != body.business_user_id:
@@ -155,17 +155,17 @@ async def get_rewards_pass(slug: str = Query(..., min_length=1)):
         raise HTTPException(status_code=503, detail="Apple Wallet not configured")
 
     sb = get_supabase()
-    card = sb.table("reward_cards").select("*").eq("slug", slug).maybe_single().execute().data
+    card = single_data(sb.table("reward_cards").select("*").eq("slug", slug).maybe_single().execute())
     if not card:
         raise HTTPException(status_code=404, detail="No rewards card found for that link")
 
-    program = (
+    program = single_data(
         sb.table("reward_programs")
         .select("*")
         .eq("business_user_id", card["business_user_id"])
         .maybe_single()
         .execute()
-    ).data
+    )
     if not program:
         raise HTTPException(status_code=404, detail="This card's business program no longer exists")
 
