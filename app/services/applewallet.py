@@ -181,6 +181,73 @@ def build_pass_json(
     }
 
 
+def build_storecard_pass_json(
+    *,
+    serial_number: str,
+    business_name: str,
+    stamps: int,
+    reward_threshold: int,
+    reward_description: str | None,
+    barcode_url: str,
+    bg_color: str | None = None,
+) -> dict:
+    """storeCard-style pass (Apple's built-in punch-card layout) for the
+    restaurant rewards/loyalty program — one of these per customer per
+    business, separate from the single business-identity card in
+    build_pass_json(). stamps/reward_threshold render as "N / M" so the
+    customer can see progress at a glance; re-issuing with an incremented
+    stamps value (same serial_number) is how a stamp gets "added" — there's
+    no live push yet, so the customer needs to re-download to see the
+    update until the Apple PassKit web service + APNs piece is built.
+    """
+    foreground_color, label_color = _contrast_colors(bg_color)
+    earned = stamps >= reward_threshold
+
+    return {
+        "formatVersion": 1,
+        "passTypeIdentifier": settings.apple_pass_type_id,
+        "teamIdentifier": settings.apple_team_id,
+        "serialNumber": serial_number,
+        "organizationName": "FASS",
+        "description": f"{business_name} — Rewards Card",
+        "logoText": f"{business_name} Rewards",
+        "backgroundColor": _hex_to_rgb_string(bg_color, fallback="rgb(15, 81, 50)"),
+        "foregroundColor": foreground_color,
+        "labelColor": label_color,
+        "storeCard": {
+            "primaryFields": [
+                {
+                    "key": "stamps",
+                    "label": "REWARD READY!" if earned else "STAMPS",
+                    "value": f"{stamps} / {reward_threshold}" if not earned else "Show this to redeem",
+                }
+            ],
+            "secondaryFields": [
+                {"key": "business", "label": "BUSINESS", "value": business_name},
+            ],
+            "backFields": [
+                {
+                    "key": "about",
+                    "label": "How it works",
+                    "value": reward_description or f"Collect {reward_threshold} stamps to earn your reward. Ask staff to stamp this card on each qualifying visit.",
+                },
+                {
+                    "key": "fass",
+                    "label": "Powered by",
+                    "value": "FASS Wallet — flow.fass.systems",
+                },
+            ],
+        },
+        "barcodes": [
+            {
+                "message": barcode_url,
+                "format": "PKBarcodeFormatQR",
+                "messageEncoding": "iso-8859-1",
+            }
+        ],
+    }
+
+
 def _sha1_hex(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
@@ -221,45 +288,11 @@ def _sign_manifest(manifest_bytes: bytes) -> bytes:
         return sig_path.read_bytes()
 
 
-def generate_pkpass(
-    *,
-    business_name: str,
-    address: str | None = None,
-    naics: str | None = None,
-    website: str | None = None,
-    phone: str | None = None,
-    barcode_url: str | None = None,
-    serial_number: str | None = None,
-    bg_color: str | None = None,
-    logo_url: str | None = None,
-    show_address: bool = True,
-    show_naics: bool = True,
-    show_phone: bool = True,
-    show_website: bool = True,
-    watermark: bool = False,
-) -> bytes:
-    """Returns the raw bytes of a signed .pkpass file."""
-    if not apple_wallet_configured():
-        raise RuntimeError("Apple Wallet certs are not configured")
-
-    serial = serial_number or str(uuid.uuid4())
-    barcode_target = barcode_url or "https://flow.fass.systems"
-
-    pass_dict = build_pass_json(
-        serial_number=serial,
-        business_name=business_name,
-        address=address,
-        naics=naics,
-        website=website,
-        phone=phone,
-        barcode_url=barcode_target,
-        bg_color=bg_color,
-        show_address=show_address,
-        show_naics=show_naics,
-        show_phone=show_phone,
-        show_website=show_website,
-        watermark=watermark,
-    )
+def _zip_and_sign(pass_dict: dict, logo_url: str | None = None) -> bytes:
+    """Shared tail end of pass generation: serialize pass.json, pull in the
+    bundled (or custom-logo) image assets, build+sign manifest.json, zip it
+    all up. Used by both the business-card and storeCard pass builders so
+    a new pass type never has to re-implement the signing/packaging part."""
     pass_json_bytes = json.dumps(pass_dict, separators=(",", ":")).encode("utf-8")
 
     # Best-effort custom logo download — only replaces logo.png/@2x/@3x, never
@@ -292,3 +325,75 @@ def generate_pkpass(
             zf.writestr(fname, data)
 
     return buf.getvalue()
+
+
+def generate_pkpass(
+    *,
+    business_name: str,
+    address: str | None = None,
+    naics: str | None = None,
+    website: str | None = None,
+    phone: str | None = None,
+    barcode_url: str | None = None,
+    serial_number: str | None = None,
+    bg_color: str | None = None,
+    logo_url: str | None = None,
+    show_address: bool = True,
+    show_naics: bool = True,
+    show_phone: bool = True,
+    show_website: bool = True,
+    watermark: bool = False,
+) -> bytes:
+    """Returns the raw bytes of a signed .pkpass file (business card)."""
+    if not apple_wallet_configured():
+        raise RuntimeError("Apple Wallet certs are not configured")
+
+    serial = serial_number or str(uuid.uuid4())
+    barcode_target = barcode_url or "https://flow.fass.systems"
+
+    pass_dict = build_pass_json(
+        serial_number=serial,
+        business_name=business_name,
+        address=address,
+        naics=naics,
+        website=website,
+        phone=phone,
+        barcode_url=barcode_target,
+        bg_color=bg_color,
+        show_address=show_address,
+        show_naics=show_naics,
+        show_phone=show_phone,
+        show_website=show_website,
+        watermark=watermark,
+    )
+    return _zip_and_sign(pass_dict, logo_url=logo_url)
+
+
+def generate_storecard_pkpass(
+    *,
+    business_name: str,
+    stamps: int,
+    reward_threshold: int = 10,
+    reward_description: str | None = None,
+    barcode_url: str | None = None,
+    serial_number: str | None = None,
+    bg_color: str | None = None,
+    logo_url: str | None = None,
+) -> bytes:
+    """Returns the raw bytes of a signed .pkpass file (rewards punch card)."""
+    if not apple_wallet_configured():
+        raise RuntimeError("Apple Wallet certs are not configured")
+
+    serial = serial_number or str(uuid.uuid4())
+    barcode_target = barcode_url or "https://flow.fass.systems"
+
+    pass_dict = build_storecard_pass_json(
+        serial_number=serial,
+        business_name=business_name,
+        stamps=stamps,
+        reward_threshold=reward_threshold,
+        reward_description=reward_description,
+        barcode_url=barcode_target,
+        bg_color=bg_color,
+    )
+    return _zip_and_sign(pass_dict, logo_url=logo_url)
