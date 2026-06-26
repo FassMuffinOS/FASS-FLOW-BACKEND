@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routers import auth, subscriptions, users, ai, admin, wardog, network, business_lookup, wallet, wallet_passkit, rewards, business_profile
+from app.routers import auth, subscriptions, users, ai, admin, wardog, network, business_lookup, wallet, wallet_passkit, wallet_campaigns, rewards, business_profile
 
 app = FastAPI(
     title="FASS Flow API",
@@ -39,6 +39,7 @@ app.include_router(network.router,       prefix="/api/v1")
 app.include_router(business_lookup.router, prefix="/api/v1")
 app.include_router(wallet.router,        prefix="/api/v1")
 app.include_router(wallet_passkit.router, prefix="/api/v1")
+app.include_router(wallet_campaigns.router, prefix="/api/v1")
 app.include_router(rewards.router,       prefix="/api/v1")
 app.include_router(business_profile.router, prefix="/api/v1")
 

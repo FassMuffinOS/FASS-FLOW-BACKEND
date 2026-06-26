@@ -210,18 +210,55 @@ def build_storecard_pass_json(
     reward_description: str | None,
     barcode_url: str,
     bg_color: str | None = None,
+    offer_message: str | None = None,
+    offer_detail: str | None = None,
 ) -> dict:
     """storeCard-style pass (Apple's built-in punch-card layout) for the
     restaurant rewards/loyalty program — one of these per customer per
     business, separate from the single business-identity card in
     build_pass_json(). stamps/reward_threshold render as "N / M" so the
     customer can see progress at a glance; re-issuing with an incremented
-    stamps value (same serial_number) is how a stamp gets "added" — there's
-    no live push yet, so the customer needs to re-download to see the
-    update until the Apple PassKit web service + APNs piece is built.
+    stamps value (same serial_number) is how a stamp gets "added", and now
+    that the PassKit web service + APNs piece exists, that re-issue is
+    pushed straight to the device instead of waiting on a manual re-open.
+
+    offer_message/offer_detail surface a live Wallet Messaging campaign
+    (see wallet_campaigns.py): when present, a headerField carries
+    Apple Wallet's `changeMessage` mechanism so the NEXT push-triggered
+    re-fetch that changes this field's value pops a system notification
+    banner on the lock screen reading the campaign's message — no custom
+    notification system needed, Wallet does it natively off this field.
     """
     foreground_color, label_color = _contrast_colors(bg_color)
     earned = stamps >= reward_threshold
+
+    header_fields = []
+    if offer_message:
+        header_fields.append({
+            "key": "offer",
+            "label": "OFFER",
+            "value": offer_message,
+            "changeMessage": "🎁 %@",
+        })
+
+    back_fields = [
+        {
+            "key": "about",
+            "label": "How it works",
+            "value": reward_description or f"Collect {reward_threshold} stamps to earn your reward. Ask staff to stamp this card on each qualifying visit.",
+        },
+    ]
+    if offer_message:
+        back_fields.append({
+            "key": "offer_detail",
+            "label": "Current Offer",
+            "value": offer_detail or offer_message,
+        })
+    back_fields.append({
+        "key": "fass",
+        "label": "Powered by",
+        "value": "FASS Wallet — flow.fass.systems",
+    })
 
     pass_dict = {
         "formatVersion": 1,
@@ -235,6 +272,7 @@ def build_storecard_pass_json(
         "foregroundColor": foreground_color,
         "labelColor": label_color,
         "storeCard": {
+            "headerFields": header_fields,
             "primaryFields": [
                 {
                     "key": "stamps",
@@ -245,18 +283,7 @@ def build_storecard_pass_json(
             "secondaryFields": [
                 {"key": "business", "label": "BUSINESS", "value": business_name},
             ],
-            "backFields": [
-                {
-                    "key": "about",
-                    "label": "How it works",
-                    "value": reward_description or f"Collect {reward_threshold} stamps to earn your reward. Ask staff to stamp this card on each qualifying visit.",
-                },
-                {
-                    "key": "fass",
-                    "label": "Powered by",
-                    "value": "FASS Wallet — flow.fass.systems",
-                },
-            ],
+            "backFields": back_fields,
         },
         "barcodes": [
             {
@@ -403,6 +430,8 @@ def generate_storecard_pkpass(
     serial_number: str | None = None,
     bg_color: str | None = None,
     logo_url: str | None = None,
+    offer_message: str | None = None,
+    offer_detail: str | None = None,
 ) -> bytes:
     """Returns the raw bytes of a signed .pkpass file (rewards punch card)."""
     if not apple_wallet_configured():
@@ -419,5 +448,7 @@ def generate_storecard_pkpass(
         reward_description=reward_description,
         barcode_url=barcode_target,
         bg_color=bg_color,
+        offer_message=offer_message,
+        offer_detail=offer_detail,
     )
     return _zip_and_sign(pass_dict, logo_url=logo_url)

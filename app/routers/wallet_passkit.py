@@ -33,6 +33,7 @@ from app.services.applewallet import (
     generate_storecard_pkpass,
     push_auth_token,
 )
+from app.routers.wallet_campaigns import active_offer_for_card
 
 router = APIRouter(prefix="/passkit", tags=["wallet-passkit"])
 
@@ -189,15 +190,18 @@ async def get_latest_pass(pass_type_identifier: str, serial_number: str, authori
         )
         if not program:
             raise HTTPException(status_code=404, detail="This card's business program no longer exists")
+        offer_message, offer_detail = active_offer_for_card(sb, record)
         pkpass_bytes = generate_storecard_pkpass(
             business_name=program["business_name"],
             stamps=record["stamps"],
             reward_threshold=program.get("reward_threshold", 10),
             reward_description=program.get("reward_description"),
-            barcode_url=f"https://flow.fass.systems/rewards/{serial_number}",
+            barcode_url=f"https://flow.fass.systems/rewards/scan/{serial_number}",
             serial_number=serial_number,
             bg_color=program.get("bg_color"),
             logo_url=program.get("logo_url"),
+            offer_message=offer_message,
+            offer_detail=offer_detail,
         )
 
     return Response(

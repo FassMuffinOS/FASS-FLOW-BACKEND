@@ -39,6 +39,7 @@ from pydantic import BaseModel
 from app.database import get_supabase, single_data
 from app.services.apns import notify_devices
 from app.services.applewallet import apple_wallet_configured, generate_storecard_pkpass
+from app.routers.wallet_campaigns import active_offer_for_card
 
 router = APIRouter(prefix="/rewards", tags=["rewards"])
 
@@ -231,7 +232,13 @@ async def get_rewards_pass(slug: str = Query(..., min_length=1)):
     if not program:
         raise HTTPException(status_code=404, detail="This card's business program no longer exists")
 
-    barcode_url = f"https://flow.fass.systems/rewards/{slug}"
+    # Points at the staff redemption confirm page, not a re-download link —
+    # this is the SAME QR a customer's Wallet pass already shows, so staff
+    # can scan it with their phone's normal camera app to redeem a live
+    # Wallet Messaging offer (see wallet_campaigns.py) without any in-app
+    # scanner. A customer never needs to scan their own card's QR.
+    barcode_url = f"https://flow.fass.systems/rewards/scan/{slug}"
+    offer_message, offer_detail = active_offer_for_card(sb, card)
 
     try:
         pkpass_bytes = generate_storecard_pkpass(
@@ -243,6 +250,8 @@ async def get_rewards_pass(slug: str = Query(..., min_length=1)):
             serial_number=slug,
             bg_color=program.get("bg_color"),
             logo_url=program.get("logo_url"),
+            offer_message=offer_message,
+            offer_detail=offer_detail,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
