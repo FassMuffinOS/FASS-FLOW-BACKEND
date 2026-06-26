@@ -299,6 +299,83 @@ def build_storecard_pass_json(
     return pass_dict
 
 
+def build_giftcard_pass_json(
+    *,
+    serial_number: str,
+    business_name: str,
+    balance: float,
+    original_value: float,
+    barcode_url: str,
+    bg_color: str | None = None,
+) -> dict:
+    """storeCard-style pass for a prepaid dollar-balance gift card — same
+    Pass Type ID and webServiceURL mechanism as build_storecard_pass_json,
+    so a redemption (POST /giftcards/redeem) that decrements balance and
+    re-issues with the same serial_number pushes live to the device exactly
+    like a stamp does, no re-download needed.
+
+    Redemption today is QR-scan only (barcode_url points at the staff
+    redeem-confirm page, same pattern as Wallet Messaging offers) — Apple
+    gates true NFC-tap redemption behind a separate entitlement application,
+    so this intentionally ships without it; the balance/ledger model here
+    doesn't change if/when that's added later, only the redemption trigger
+    would.
+    """
+    foreground_color, label_color = _contrast_colors(bg_color)
+    depleted = balance <= 0
+
+    back_fields = [
+        {
+            "key": "about",
+            "label": "How it works",
+            "value": "Show this card to staff to redeem all or part of the balance toward a purchase.",
+        },
+        {"key": "original_value", "label": "Original value", "value": f"${original_value:.2f}"},
+        {
+            "key": "fass",
+            "label": "Powered by",
+            "value": "FASS Wallet — flow.fass.systems",
+        },
+    ]
+
+    pass_dict = {
+        "formatVersion": 1,
+        "passTypeIdentifier": settings.apple_pass_type_id,
+        "teamIdentifier": settings.apple_team_id,
+        "serialNumber": serial_number,
+        "organizationName": "FASS",
+        "description": f"{business_name} — Gift Card",
+        "logoText": f"{business_name} Gift Card",
+        "backgroundColor": _hex_to_rgb_string(bg_color, fallback="rgb(15, 81, 50)"),
+        "foregroundColor": foreground_color,
+        "labelColor": label_color,
+        "storeCard": {
+            "primaryFields": [
+                {
+                    "key": "balance",
+                    "label": "FULLY REDEEMED" if depleted else "BALANCE",
+                    "value": "$0.00" if depleted else f"${balance:.2f}",
+                }
+            ],
+            "secondaryFields": [
+                {"key": "business", "label": "BUSINESS", "value": business_name},
+            ],
+            "backFields": back_fields,
+        },
+        "barcodes": [
+            {
+                "message": barcode_url,
+                "format": "PKBarcodeFormatQR",
+                "messageEncoding": "iso-8859-1",
+            }
+        ],
+    }
+    if settings.backend_base_url:
+        pass_dict["webServiceURL"] = f"{settings.backend_base_url}/api/v1/passkit"
+        pass_dict["authenticationToken"] = push_auth_token(serial_number)
+    return pass_dict
+
+
 def _sha1_hex(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
@@ -450,5 +527,33 @@ def generate_storecard_pkpass(
         bg_color=bg_color,
         offer_message=offer_message,
         offer_detail=offer_detail,
+    )
+    return _zip_and_sign(pass_dict, logo_url=logo_url)
+
+
+def generate_giftcard_pkpass(
+    *,
+    business_name: str,
+    balance: float,
+    original_value: float,
+    barcode_url: str | None = None,
+    serial_number: str | None = None,
+    bg_color: str | None = None,
+    logo_url: str | None = None,
+) -> bytes:
+    """Returns the raw bytes of a signed .pkpass file (prepaid gift card)."""
+    if not apple_wallet_configured():
+        raise RuntimeError("Apple Wallet certs are not configured")
+
+    serial = serial_number or str(uuid.uuid4())
+    barcode_target = barcode_url or "https://flow.fass.systems"
+
+    pass_dict = build_giftcard_pass_json(
+        serial_number=serial,
+        business_name=business_name,
+        balance=balance,
+        original_value=original_value,
+        barcode_url=barcode_target,
+        bg_color=bg_color,
     )
     return _zip_and_sign(pass_dict, logo_url=logo_url)

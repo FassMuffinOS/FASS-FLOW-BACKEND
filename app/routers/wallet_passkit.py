@@ -15,11 +15,11 @@ Every device-originated call except /v1/log authenticates via
 from applewallet.push_auth_token() — see that function's docstring for why
 there's no new DB column for this.
 
-serial_number doubles as the primary/unique key across BOTH pass tables in
-this repo (wallet_passes.slug, reward_cards.slug) — there's only one Apple
-Pass Type ID covering both pass styles (see applewallet.py), so _find_pass()
-below just checks both tables rather than needing a passTypeIdentifier
-lookup table.
+serial_number doubles as the primary/unique key across ALL pass tables in
+this repo (wallet_passes.slug, reward_cards.slug, gift_cards.slug) —
+there's only one Apple Pass Type ID covering every pass style (see
+applewallet.py), so _find_pass() below just checks each table rather than
+needing a passTypeIdentifier lookup table.
 """
 from datetime import datetime, timezone
 
@@ -29,6 +29,7 @@ from fastapi.responses import Response
 from app.database import get_supabase, single_data
 from app.services.applewallet import (
     apple_wallet_configured,
+    generate_giftcard_pkpass,
     generate_pkpass,
     generate_storecard_pkpass,
     push_auth_token,
@@ -54,8 +55,8 @@ def _parse_timestamp(raw: str | None) -> datetime | None:
 
 
 def _find_pass(sb, serial_number: str):
-    """Returns (kind, record) — kind is 'wallet' or 'rewards' — or
-    (None, None) if no pass anywhere has this serial number."""
+    """Returns (kind, record) — kind is 'wallet', 'rewards', or 'giftcard' —
+    or (None, None) if no pass anywhere has this serial number."""
     wallet_row = single_data(
         sb.table("wallet_passes").select("*").eq("slug", serial_number).maybe_single().execute()
     )
@@ -66,6 +67,11 @@ def _find_pass(sb, serial_number: str):
     )
     if reward_row:
         return "rewards", reward_row
+    gift_row = single_data(
+        sb.table("gift_cards").select("*").eq("slug", serial_number).maybe_single().execute()
+    )
+    if gift_row:
+        return "giftcard", gift_row
     return None, None
 
 
@@ -180,7 +186,7 @@ async def get_latest_pass(pass_type_identifier: str, serial_number: str, authori
             show_website=record.get("show_website", True),
             watermark=not record.get("purchased"),
         )
-    else:
+    elif kind == "rewards":
         program = single_data(
             sb.table("reward_programs")
             .select("*")
@@ -202,6 +208,22 @@ async def get_latest_pass(pass_type_identifier: str, serial_number: str, authori
             logo_url=program.get("logo_url"),
             offer_message=offer_message,
             offer_detail=offer_detail,
+        )
+    else:  # giftcard
+        profile = single_data(
+            sb.table("business_profiles")
+            .select("business_name")
+            .eq("user_id", record["business_user_id"])
+            .maybe_single()
+            .execute()
+        )
+        business_name = (profile or {}).get("business_name") or "Your Business"
+        pkpass_bytes = generate_giftcard_pkpass(
+            business_name=business_name,
+            balance=record["balance"],
+            original_value=record["original_value"],
+            barcode_url=f"https://flow.fass.systems/giftcards/scan/{serial_number}",
+            serial_number=serial_number,
         )
 
     return Response(
