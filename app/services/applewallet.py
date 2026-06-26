@@ -91,7 +91,16 @@ def apple_wallet_configured() -> bool:
 
 
 def _decode(b64_value: str) -> bytes:
-    return base64.b64decode(b64_value)
+    """Decodes a base64 env var. Tolerates the two most common copy/paste
+    mangling issues with Railway (or any dashboard) env var fields: stray
+    whitespace/newlines getting embedded, and trailing '=' padding getting
+    silently stripped — both produce a binascii 'Incorrect padding' error
+    on a value that is otherwise a perfectly valid PEM blob."""
+    cleaned = "".join(b64_value.split())
+    missing_padding = len(cleaned) % 4
+    if missing_padding:
+        cleaned += "=" * (4 - missing_padding)
+    return base64.b64decode(cleaned)
 
 
 def build_pass_json(
