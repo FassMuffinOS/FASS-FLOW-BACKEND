@@ -147,6 +147,25 @@ async def stripe_webhook(
             .execute()
         )
 
+    elif event["type"] == "account.updated":
+        # Fired by Stripe as a Connect Express account moves through
+        # onboarding/verification (see stripe_connect.py). Never trust the
+        # frontend redirect alone for this — Stripe can flag an account for
+        # additional review or the user can abandon the tab mid-flow, so
+        # this event is the only reliable source of truth for whether a
+        # business can actually receive payouts yet.
+        account = event["data"]["object"]
+        (
+            sb.table("business_profiles")
+            .update({
+                "connect_onboarded": bool(account.get("details_submitted")),
+                "connect_payouts_enabled": bool(account.get("payouts_enabled")),
+                "connect_updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("stripe_connect_account_id", account["id"])
+            .execute()
+        )
+
     elif event["type"] in (
         "invoice.payment_failed",
         "invoice.payment_succeeded",
