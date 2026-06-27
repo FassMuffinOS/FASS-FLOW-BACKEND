@@ -18,6 +18,7 @@ REST endpoints below remain the source of truth for initial loads, sending,
 and read receipts — realtime only pushes the "something changed, refetch /
 append" signal.
 """
+import logging
 import uuid
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -27,6 +28,8 @@ from app.config import settings
 from app.database import get_supabase, single_data
 from app.services.llm import LLMUnavailableError, llm_router
 from app.web_push import send_push_to_user
+
+logger = logging.getLogger("fass_flow.chat")
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -312,11 +315,18 @@ async def _maybe_ai_reply(sb, thread_id: str, sender_id: str) -> None:
     LLM provider is configured or the call fails, so the human's own send is
     never affected by the AI being unavailable."""
     ai_id = settings.ai_assistant_user_id
-    if not ai_id or sender_id == ai_id:
+    if not ai_id:
+        logger.warning("AI reply skipped: AI_ASSISTANT_USER_ID is not configured")
+        return
+    if sender_id == ai_id:
         return
     try:
         participant_ids = set(_other_participant_ids(sb, thread_id, sender_id)) | {sender_id}
         if ai_id not in participant_ids:
+            logger.warning(
+                "AI reply skipped: AI (%s) is not a participant in thread %s (participants: %s)",
+                ai_id, thread_id, participant_ids,
+            )
             return
         history = (
             sb.table("chat_messages")
@@ -346,10 +356,10 @@ async def _maybe_ai_reply(sb, thread_id: str, sender_id: str) -> None:
             "read_by": [ai_id],
         }).execute()
         _notify_other_participants(sb, thread_id, ai_id, reply)
-    except LLMUnavailableError:
-        pass  # no provider configured yet — AI contact just won't reply
+    except LLMUnavailableError as e:
+        logger.warning("AI reply skipped: no LLM provider available: %s", e)
     except Exception:
-        pass
+        logger.exception("AI reply failed in thread %s", thread_id)
 
 
 def _other_participant_ids(sb, thread_id: str, exclude_user_id: str) -> list[str]:
