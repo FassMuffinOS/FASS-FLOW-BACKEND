@@ -150,71 +150,82 @@ async def start_thread(body: StartThreadRequest):
 @router.get("/threads/mine")
 async def my_threads(user_id: str):
     """Inbox list: every thread the user's in, with the other participant(s),
-    the linked post (if any), and the most recent message for a preview line."""
+    the linked post (if any), and the most recent message for a preview line.
+
+    Wrapped in a broad try/except purely for visibility: this query embeds
+    chat_thread_participants -> profiles, which silently 500s if that FK
+    relationship is ever missing/renamed (see partner_network_fk_fix.sql).
+    Before this, a failure here meant the sidebar just looked permanently
+    empty with zero trace in the logs — same failure mode start_thread had
+    before it got the same treatment."""
     sb = get_supabase()
-    my_rows = (
-        sb.table("chat_thread_participants")
-        .select("thread_id")
-        .eq("user_id", user_id)
-        .execute()
-        .data
-        or []
-    )
-    thread_ids = [r["thread_id"] for r in my_rows]
-    if not thread_ids:
-        return {"threads": []}
+    try:
+        my_rows = (
+            sb.table("chat_thread_participants")
+            .select("thread_id")
+            .eq("user_id", user_id)
+            .execute()
+            .data
+            or []
+        )
+        thread_ids = [r["thread_id"] for r in my_rows]
+        if not thread_ids:
+            return {"threads": []}
 
-    threads = (
-        sb.table("chat_threads")
-        .select("*, partner_posts(title), chat_thread_participants(user_id, profiles(full_name))")
-        .in_("id", thread_ids)
-        .order("created_at", desc=True)
-        .execute()
-        .data
-        or []
-    )
+        threads = (
+            sb.table("chat_threads")
+            .select("*, partner_posts(title), chat_thread_participants(user_id, profiles(full_name))")
+            .in_("id", thread_ids)
+            .order("created_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
 
-    all_messages = (
-        sb.table("chat_messages")
-        .select("id, thread_id, body, sender_id, read_by, created_at")
-        .in_("thread_id", thread_ids)
-        .order("created_at", desc=True)
-        .execute()
-        .data
-        or []
-    )
-    last_by_thread = {}
-    unread_by_thread = {}
-    for m in all_messages:
-        last_by_thread.setdefault(m["thread_id"], m)  # first hit per thread = newest, since already sorted desc
-        if m["sender_id"] != user_id and user_id not in (m.get("read_by") or []):
-            unread_by_thread[m["thread_id"]] = unread_by_thread.get(m["thread_id"], 0) + 1
+        all_messages = (
+            sb.table("chat_messages")
+            .select("id, thread_id, body, sender_id, read_by, created_at")
+            .in_("thread_id", thread_ids)
+            .order("created_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        last_by_thread = {}
+        unread_by_thread = {}
+        for m in all_messages:
+            last_by_thread.setdefault(m["thread_id"], m)  # first hit per thread = newest, since already sorted desc
+            if m["sender_id"] != user_id and user_id not in (m.get("read_by") or []):
+                unread_by_thread[m["thread_id"]] = unread_by_thread.get(m["thread_id"], 0) + 1
 
-    out = []
-    for t in threads:
-        others = [
-            p for p in (t.get("chat_thread_participants") or [])
-            if p["user_id"] != user_id
-        ]
-        last = last_by_thread.get(t["id"])
-        out.append({
-            "id": t["id"],
-            "post_title": (t.get("partner_posts") or {}).get("title") if t.get("partner_posts") else None,
-            "other_participants": [
-                {"user_id": p["user_id"], "full_name": (p.get("profiles") or {}).get("full_name")}
-                for p in others
-            ],
-            "last_message": last,
-            "unread_count": unread_by_thread.get(t["id"], 0),
-            # Sort key only — not meant for display. Falls back to the
-            # thread's own created_at so a brand-new, message-less
-            # conversation still slots in by recency.
-            "_sort_at": (last or {}).get("created_at") or t["created_at"],
-        })
-    out.sort(key=lambda r: r["_sort_at"], reverse=True)
-    for r in out:
-        del r["_sort_at"]
-    return {"threads": out}
+        out = []
+        for t in threads:
+            others = [
+                p for p in (t.get("chat_thread_participants") or [])
+                if p["user_id"] != user_id
+            ]
+            last = last_by_thread.get(t["id"])
+            out.append({
+                "id": t["id"],
+                "post_title": (t.get("partner_posts") or {}).get("title") if t.get("partner_posts") else None,
+                "other_participants": [
+                    {"user_id": p["user_id"], "full_name": (p.get("profiles") or {}).get("full_name")}
+                    for p in others
+                ],
+                "last_message": last,
+                "unread_count": unread_by_thread.get(t["id"], 0),
+                # Sort key only — not meant for display. Falls back to the
+                # thread's own created_at so a brand-new, message-less
+                # conversation still slots in by recency.
+                "_sort_at": (last or {}).get("created_at") or t["created_at"],
+            })
+        out.sort(key=lambda r: r["_sort_at"], reverse=True)
+        for r in out:
+            del r["_sort_at"]
+        return {"threads": out}
+    except Exception as e:
+        logger.exception("my_threads failed for user %s", user_id)
+        raise HTTPException(status_code=500, detail=f"Could not load conversations: {e}") from e
 
 
 @router.get("/threads/{thread_id}/messages")
