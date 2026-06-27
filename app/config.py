@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     deep_seek_api_key: str = ""  # field name matches Railway's DEEP_SEEK_API_KEY env var
     llm_provider_order: str = "anthropic,deepseek,openai,gemini"
 
+    # Web Push (Messenger) — VAPID key pair for browser push notifications.
+    # Blank defaults: push sends silently no-op (logged, not raised) until
+    # these are set in Railway, same pattern as the integrations above.
+    # Generate with: vapid_public_key/vapid_private_key from `vapid` CLI or
+    # pywebpush.webpush.Vapid().generate_keys().
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_subject: str = "mailto:admin@fass.systems"
+
+    # Messenger: two always-reachable pinned contacts so "New message" search
+    # is never a dead end during cold start (few real profiles yet). Each
+    # must be a real auth.users id (profiles.id is FK'd to auth.users), so
+    # these are provisioned once via Supabase dashboard/SQL, then their ids
+    # pasted in here — see migrations/messenger_pinned_contacts.sql.
+    admin_user_id: str = ""
+    ai_assistant_user_id: str = ""
+
     class Config:
         env_file = ".env"
 
