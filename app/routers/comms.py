@@ -15,6 +15,8 @@ Ownership model matches every other router here: no auth dependency, the
 caller's business_user_id is taken at face value and the service-role
 client is used for every read/write.
 """
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -24,6 +26,8 @@ from app.database import get_supabase, single_data
 from app.services.twilio_sms import send_sms
 
 router = APIRouter(prefix="/comms", tags=["comms"])
+
+NUDGE_QUIET_DAYS = 30
 
 
 class SendRequest(BaseModel):
@@ -161,7 +165,14 @@ async def list_threads(business_user_id: str):
     """One row per phone number, most recently active first — the contact
     list view. Pulled in one query and folded down in Python since Supabase
     doesn't have a clean "latest row per group" without a view/RPC, and
-    standing up a SQL view here would be the first one in this codebase."""
+    standing up a SQL view here would be the first one in this codebase.
+
+    Also folds in the Nudge signal (days since last activity, either
+    direction, vs NUDGE_QUIET_DAYS) and the saved Contact Identity, if any —
+    both computed/joined here rather than in the frontend so a relationship
+    that's gone quiet but already covered (awarded, declined, off-cycle) can
+    be dismissed server-side via nudge_dismissed_until and stay dismissed
+    across devices."""
     sb = get_supabase()
     rows = (
         sb.table("comms_messages")
@@ -188,7 +199,101 @@ async def list_threads(business_user_id: str):
             }
         if r["direction"] == "in" and r["status"] == "received":
             threads[phone]["unread"] += 1
-    return {"threads": list(threads.values())}
+
+    contacts_by_phone = {
+        c["phone"]: c
+        for c in (
+            sb.table("comms_contacts")
+            .select("*")
+            .eq("business_user_id", business_user_id)
+            .execute()
+            .data
+            or []
+        )
+    }
+
+    now = datetime.now(timezone.utc)
+    result = []
+    for t in threads.values():
+        contact = contacts_by_phone.get(t["phone"])
+        last_at = datetime.fromisoformat(t["last_at"].replace("Z", "+00:00"))
+        days_quiet = (now - last_at).days
+        dismissed_until = contact.get("nudge_dismissed_until") if contact else None
+        nudge_dismissed = bool(
+            dismissed_until and datetime.fromisoformat(dismissed_until.replace("Z", "+00:00")) > now
+        )
+        t["days_quiet"] = days_quiet
+        t["show_nudge"] = days_quiet >= NUDGE_QUIET_DAYS and not nudge_dismissed
+        t["contact_name"] = contact.get("name") if contact else None
+        t["contact_company"] = contact.get("company") if contact else None
+        result.append(t)
+    return {"threads": result}
+
+
+class ContactRequest(BaseModel):
+    business_user_id: str
+    phone: str
+    name: str | None = None
+    company: str | None = None
+    naics: str | None = None
+    last_award_date: str | None = None
+    notes: str | None = None
+
+
+@router.get("/contact")
+async def get_contact(business_user_id: str, phone: str):
+    sb = get_supabase()
+    contact = single_data(
+        sb.table("comms_contacts")
+        .select("*")
+        .eq("business_user_id", business_user_id)
+        .eq("phone", phone)
+        .maybe_single()
+        .execute()
+    )
+    return {"contact": contact}
+
+
+@router.put("/contact")
+async def upsert_contact(body: ContactRequest):
+    sb = get_supabase()
+    row = {
+        "business_user_id": body.business_user_id,
+        "phone": body.phone,
+        "name": body.name or None,
+        "company": body.company or None,
+        "naics": body.naics or None,
+        "last_award_date": body.last_award_date or None,
+        "notes": body.notes or None,
+        "updated_at": "now()",
+    }
+    result = sb.table("comms_contacts").upsert(row).execute()
+    return {"contact": single_data(result)}
+
+
+class DismissNudgeRequest(BaseModel):
+    business_user_id: str
+    phone: str
+    days: int = 14
+
+
+@router.post("/contact/dismiss-nudge")
+async def dismiss_nudge(body: DismissNudgeRequest):
+    """Soft-snooze a quiet-contact nudge — used when the relationship is
+    intentionally dormant (already awarded, declined, off-cycle) so it stops
+    resurfacing without requiring you to message someone just to silence it."""
+    sb = get_supabase()
+    from datetime import timedelta
+
+    until = (datetime.now(timezone.utc) + timedelta(days=body.days)).isoformat()
+    row = {
+        "business_user_id": body.business_user_id,
+        "phone": body.phone,
+        "nudge_dismissed_until": until,
+        "updated_at": "now()",
+    }
+    sb.table("comms_contacts").upsert(row).execute()
+    return {"dismissed_until": until}
 
 
 @router.get("/thread")
