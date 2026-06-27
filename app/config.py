@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     backend_base_url: str = ""
     wallet_auth_secret: str = ""  # falls back to jwt_secret if blank
 
+    # Twilio SMS — powers Comms Hub. Blank defaults: /comms/send will queue
+    # the message but mark it failed immediately with a clear error instead
+    # of crashing, same pattern as the Apple Wallet settings above.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""   # the Twilio number messages are sent from, e.g. +15551234567
+    # Single-tenant MVP: inbound SMS webhooks only carry the Twilio "To"
+    # number, not a FASS user id, and there's no per-business phone-number
+    # table yet (every business shares the one Twilio number above). Until
+    # that's built, every inbound reply is attributed to this one user.
+    twilio_inbound_business_user_id: str = ""
+
     # AI providers — all optional. The LLM router skips any provider
     # whose key is blank and falls through to the next one in order.
     anthropic_api_key: str = ""
