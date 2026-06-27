@@ -32,6 +32,42 @@ def _check_admin_secret(x_admin_secret: str | None):
         raise HTTPException(status_code=401, detail="Invalid admin secret")
 
 
+@router.get("/clients")
+async def list_clients(x_admin_secret: str = Header(None)):
+    """Founder-only roster — every bd_partner_clients row, newest first,
+    joined against profiles for a display name/company so the admin
+    console doesn't just show raw UUIDs. Mirrors the rest of this file's
+    admin-secret pattern; nothing here is reachable by a regular client."""
+    _check_admin_secret(x_admin_secret)
+    sb = get_supabase()
+    clients = (
+        sb.table("bd_partner_clients")
+        .select("*")
+        .order("started_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    if not clients:
+        return {"clients": []}
+
+    user_ids = [c["user_id"] for c in clients]
+    profiles = (
+        sb.table("profiles")
+        .select("id, full_name, company_name")
+        .in_("id", user_ids)
+        .execute()
+        .data
+        or []
+    )
+    profiles_by_id = {p["id"]: p for p in profiles}
+    for c in clients:
+        p = profiles_by_id.get(c["user_id"])
+        c["full_name"] = p.get("full_name") if p else None
+        c["company_name"] = p.get("company_name") if p else None
+    return {"clients": clients}
+
+
 @router.get("/status")
 async def get_status(user_id: str):
     sb = get_supabase()
