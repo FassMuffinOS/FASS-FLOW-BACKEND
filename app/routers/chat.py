@@ -126,12 +126,21 @@ async def start_thread(body: StartThreadRequest):
             exact = next((t for t in matches if t["post_id"] == body.post_id), None)
             return {"thread_id": (exact or matches[0])["id"]}
 
-    thread = single_data(sb.table("chat_threads").insert({"post_id": body.post_id}).execute())
-    thread_id = thread["id"]
-    sb.table("chat_thread_participants").insert([
-        {"thread_id": thread_id, "user_id": body.user_id},
-        {"thread_id": thread_id, "user_id": body.other_user_id},
-    ]).execute()
+    try:
+        thread = single_data(sb.table("chat_threads").insert({"post_id": body.post_id}).execute())
+        thread_id = thread["id"]
+        sb.table("chat_thread_participants").insert([
+            {"thread_id": thread_id, "user_id": body.user_id},
+            {"thread_id": thread_id, "user_id": body.other_user_id},
+        ]).execute()
+    except Exception as e:
+        # Most common cause: other_user_id doesn't correspond to a real
+        # auth.users row (e.g. a pinned contact's env-var id is unset, typo'd,
+        # or its one-time profiles/auth provisioning was skipped) — the FK on
+        # chat_thread_participants.user_id rejects the insert. Surfacing the
+        # real detail here (instead of letting it 500 opaquely) is what makes
+        # that diagnosable from the frontend network tab.
+        raise HTTPException(status_code=400, detail=f"Could not start thread: {e}") from e
     return {"thread_id": thread_id}
 
 
