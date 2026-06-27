@@ -38,6 +38,88 @@ CONVERSION_SOURCES = {"subscription", "wallet_pass", "masterclass", "bd_partner"
 # dropdown, only ever inserted by _credit_recruiter_override below.
 OVERRIDE_SOURCE = "override"
 
+# --- Gamification shell (FASS Creator OS, phase 1) ------------------------
+# Simple action-based XP: a fixed amount per discrete action, recorded once
+# each in affiliate_xp_events (unique per affiliate+action) so nothing can
+# be double-awarded even if an endpoint gets called twice. Leveling is a
+# flat curve (500 XP per level) — easy to reason about, easy to retune
+# later without a migration since it's computed, not stored.
+XP_VALUES = {
+    "join": 100,             # generated your referral link
+    "complete_profile": 100, # Day-1 onboarding mission item
+    "watch_onboarding": 100, # Day-1 onboarding mission item
+    "assignment_done": 25,   # today's assignment, once per calendar day
+    "conversion": 50,        # a referral of yours converts
+    "recruit": 100,          # someone joins as an affiliate under your link
+}
+LEVEL_XP_STEP = 500
+RANK_TITLES = [
+    (1, "New Creator"),
+    (3, "Rising Creator"),
+    (6, "Regional Partner"),
+    (10, "National Partner"),
+    (15, "Enterprise Partner"),
+]
+
+
+def _level_for_xp(xp: int) -> int:
+    return int(xp // LEVEL_XP_STEP) + 1
+
+
+def _rank_for_level(level: int) -> str:
+    title = RANK_TITLES[0][1]
+    for min_level, name in RANK_TITLES:
+        if level >= min_level:
+            title = name
+    return title
+
+
+def _next_rank_title(level: int) -> str | None:
+    for min_level, name in RANK_TITLES:
+        if level < min_level:
+            return name
+    return None
+
+
+def _gamification_snapshot(xp: int) -> dict:
+    xp = int(xp or 0)
+    level = _level_for_xp(xp)
+    xp_into_level = xp % LEVEL_XP_STEP
+    return {
+        "xp": xp,
+        "level": level,
+        "rank": _rank_for_level(level),
+        "next_rank": _next_rank_title(level),
+        "xp_into_level": xp_into_level,
+        "xp_to_next_level": LEVEL_XP_STEP - xp_into_level,
+        "level_progress_pct": round(xp_into_level / LEVEL_XP_STEP * 100, 1),
+    }
+
+
+def _award_xp(sb, affiliate_user_id: str, action: str, xp_amount: int, note: str | None = None):
+    """Idempotent per (affiliate_user_id, action) — relies on the unique
+    constraint in affiliate_xp_events. Repeatable actions (conversions,
+    recruits, daily assignments) encode their own uniqueness into `action`
+    (e.g. f"conversion_{conversion_id}", f"assignment_{date}")."""
+    try:
+        sb.table("affiliate_xp_events").insert({
+            "affiliate_user_id": affiliate_user_id,
+            "action": action,
+            "xp_amount": xp_amount,
+            "note": note,
+        }).execute()
+    except Exception as exc:
+        if "duplicate key" in str(exc).lower():
+            return False
+        raise
+
+    current = single_data(
+        sb.table("affiliates").select("xp").eq("user_id", affiliate_user_id).maybe_single().execute()
+    )
+    new_xp = (current.get("xp") if current else 0) or 0
+    sb.table("affiliates").update({"xp": new_xp + xp_amount}).eq("user_id", affiliate_user_id).execute()
+    return True
+
 
 def _check_admin_secret(x_admin_secret: str | None):
     if not settings.admin_secret:
@@ -123,6 +205,8 @@ def record_conversion(referred_user_id: str, source: str, amount: float, note: s
     }
     created = single_data(sb.table("affiliate_conversions").insert(row).execute())
     _credit_recruiter_override(sb, affiliate, commission, referred_user_id, note)
+    if created:
+        _award_xp(sb, affiliate["user_id"], f"conversion_{created['id']}", XP_VALUES["conversion"], "Referral converted")
     return created
 
 
@@ -169,7 +253,11 @@ async def join(body: JoinRequest):
             if recruited_by_user_id:
                 insert_row["recruited_by_user_id"] = recruited_by_user_id
             result = sb.table("affiliates").insert(insert_row).execute()
-            return {"affiliate": single_data(result)}
+            created = single_data(result)
+            _award_xp(sb, body.user_id, "join", XP_VALUES["join"], "Generated your referral link")
+            if recruited_by_user_id:
+                _award_xp(sb, recruited_by_user_id, f"recruit_{body.user_id}", XP_VALUES["recruit"], "A creator joined under your link")
+            return {"affiliate": created}
         except Exception as exc:
             if "duplicate key" in str(exc).lower():
                 continue
@@ -230,6 +318,12 @@ async def get_me(user_id: str):
         or []
     )
 
+    xp_events = (
+        sb.table("affiliate_xp_events").select("action").eq("affiliate_user_id", user_id).execute().data or []
+    )
+    done_actions = {e["action"] for e in xp_events}
+    today_key = datetime.now(timezone.utc).date().isoformat()
+
     return {
         "affiliate": affiliate,
         "clicks": clicks,
@@ -245,7 +339,61 @@ async def get_me(user_id: str):
             "override_earned": round(override_earned, 2),
             "recruit_count": len(recruits),
         },
+        "gamification": {
+            **_gamification_snapshot(affiliate.get("xp") or 0),
+            "onboarding": {
+                "join": "join" in done_actions,
+                "complete_profile": "complete_profile" in done_actions,
+                "watch_onboarding": "watch_onboarding" in done_actions,
+            },
+            "assignment_done_today": f"assignment_{today_key}" in done_actions,
+        },
     }
+
+
+class XpClaimRequest(BaseModel):
+    user_id: str
+    action: str
+
+
+CLAIMABLE_ACTIONS = {"complete_profile", "watch_onboarding"}
+
+
+@router.post("/xp/claim")
+async def claim_xp(body: XpClaimRequest):
+    """Manual, self-reported Day-1 onboarding mission items — there's no
+    backend signal for "read your profile" or "watched the video", so the
+    person just checks it off. Idempotent either way, can't be farmed."""
+    if body.action not in CLAIMABLE_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {sorted(CLAIMABLE_ACTIONS)}")
+    sb = get_supabase()
+    affiliate = single_data(
+        sb.table("affiliates").select("user_id").eq("user_id", body.user_id).maybe_single().execute()
+    )
+    if not affiliate:
+        raise HTTPException(status_code=404, detail="Not an affiliate yet")
+    awarded = _award_xp(sb, body.user_id, body.action, XP_VALUES[body.action])
+    return {"awarded": awarded, "xp_amount": XP_VALUES[body.action] if awarded else 0}
+
+
+class AssignmentDoneRequest(BaseModel):
+    user_id: str
+
+
+@router.post("/assignment/done")
+async def mark_assignment_done(body: AssignmentDoneRequest):
+    """Today's directive action item — +25 XP, once per calendar day
+    (UTC), tracked via affiliate_xp_events so it survives across devices
+    instead of living only in localStorage."""
+    sb = get_supabase()
+    affiliate = single_data(
+        sb.table("affiliates").select("user_id").eq("user_id", body.user_id).maybe_single().execute()
+    )
+    if not affiliate:
+        raise HTTPException(status_code=404, detail="Not an affiliate yet")
+    today_key = datetime.now(timezone.utc).date().isoformat()
+    awarded = _award_xp(sb, body.user_id, f"assignment_{today_key}", XP_VALUES["assignment_done"], "Completed today's assignment")
+    return {"awarded": awarded, "xp_amount": XP_VALUES["assignment_done"] if awarded else 0}
 
 
 class ClickRequest(BaseModel):
@@ -422,6 +570,8 @@ async def admin_log_conversion(body: ManualConversionRequest, x_admin_secret: st
     }
     created = single_data(sb.table("affiliate_conversions").insert(row).execute())
     _credit_recruiter_override(sb, affiliate, commission, None, body.note or None)
+    if created:
+        _award_xp(sb, body.affiliate_user_id, f"conversion_{created['id']}", XP_VALUES["conversion"], "Referral converted")
     return created
 
 
