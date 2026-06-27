@@ -1,7 +1,14 @@
 """
-AI usage quota — enforces the Lite plan's "1 AI synthesis per billing
-cycle" cap. Every other plan (starter/pro/team/promo) is unlimited and
-this is a no-op for them.
+AI usage quota — enforces the Free plan's "1 AI synthesis per billing
+cycle" cap. Every paid plan (starter/pro/team) is unlimited and this is
+a no-op for them.
+
+Was originally written for a paid "Lite" ($9.99/mo) tier; the offer
+architecture rework collapsed that into the no-checkout Free tier
+(profiles.plan defaults to 'free' in the schema already), so this now
+gates on plan == "free" instead of "lite". Anyone with a stale
+plan == "lite" row from before the rework is treated as unlimited
+(falls through with everyone else) rather than silently re-capped.
 
 Deliberately simple rather than a real metering system: one counter
 (`ai_quota_used`) and one rolling reset timestamp (`ai_quota_reset_at`)
@@ -17,7 +24,7 @@ from fastapi import HTTPException
 from app.database import get_supabase
 
 CYCLE_DAYS = 30
-LITE_PLAN_LIMIT = 1
+FREE_PLAN_LIMIT = 1
 
 
 class QuotaExceededError(HTTPException):
@@ -25,7 +32,7 @@ class QuotaExceededError(HTTPException):
         super().__init__(
             status_code=402,
             detail=(
-                "You've used this billing cycle's free AI synthesis on the Lite plan. "
+                "You've used this billing cycle's free AI synthesis on the Free plan. "
                 f"It resets {reset_at.date().isoformat()}, or upgrade to Core for unlimited AI synthesis."
             ),
         )
@@ -49,8 +56,8 @@ def check_and_consume_ai_quota(user_id: str | None) -> None:
         .execute()
     )
     profile = result.data
-    if not profile or profile.get("plan") != "lite":
-        return  # unlimited on every other plan
+    if not profile or profile.get("plan") != "free":
+        return  # unlimited on every paid plan
 
     now = datetime.now(timezone.utc)
     reset_at_raw = profile.get("ai_quota_reset_at")
@@ -66,7 +73,7 @@ def check_and_consume_ai_quota(user_id: str | None) -> None:
         return
 
     used = profile.get("ai_quota_used") or 0
-    if used >= LITE_PLAN_LIMIT:
+    if used >= FREE_PLAN_LIMIT:
         raise QuotaExceededError(reset_at)
 
     sb.table("profiles").update({"ai_quota_used": used + 1}).eq("id", user_id).execute()
