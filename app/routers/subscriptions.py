@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, Header
 from pydantic import BaseModel
 from app.config import settings
 from app.database import get_supabase
+from app.routers.affiliates import record_conversion
 
 stripe.api_key = settings.stripe_secret_key
 
@@ -90,6 +91,11 @@ async def stripe_webhook(
                     .eq("slug", slug)
                     .execute()
                 )
+            wallet_user_id = metadata.get("user_id")
+            if wallet_user_id:
+                amount = (session.get("amount_total") or 0) / 100
+                if amount > 0:
+                    record_conversion(wallet_user_id, "wallet_pass", amount)
         elif metadata.get("kind") == "gift_card":
             # Public storefront gift card purchase — mode="payment" with a
             # customer-chosen amount (see gift_cards.py's /purchase/checkout).
@@ -120,6 +126,16 @@ async def stripe_webhook(
                 "plan": plan,
                 "subscription_status": "active",
             }).execute()
+
+            # First invoice only — recurring renewals come through as
+            # invoice.payment_succeeded below, which would double-count if
+            # this also fired commission on every renewal cycle silently.
+            # That's a deliberate choice for now (commission on signup
+            # value, not lifetime recurring revenue share) — revisit if the
+            # program needs to pay out on renewals too.
+            amount = (session.get("amount_total") or 0) / 100
+            if amount > 0:
+                record_conversion(user_id, "subscription", amount)
 
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
