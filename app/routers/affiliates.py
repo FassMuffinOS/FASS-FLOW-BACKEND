@@ -34,6 +34,9 @@ from app.database import get_supabase, single_data
 router = APIRouter(prefix="/affiliates", tags=["affiliates"])
 
 CONVERSION_SOURCES = {"subscription", "wallet_pass", "masterclass", "bd_partner", "other"}
+# System-generated only — never offered in the admin console's manual-entry
+# dropdown, only ever inserted by _credit_recruiter_override below.
+OVERRIDE_SOURCE = "override"
 
 
 def _check_admin_secret(x_admin_secret: str | None):
@@ -49,6 +52,41 @@ def _generate_code(handle: str | None) -> str:
         base = "fass"
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
     return f"{base}{suffix}"
+
+
+def _credit_recruiter_override(sb, affiliate: dict, base_commission: float, referred_user_id: str | None, note: str | None):
+    """Sub-affiliate override — one level deep, no chaining further up.
+    If `affiliate` was recruited by someone (recruited_by_user_id set at
+    join time, see join() below), that recruiter earns a percentage of
+    THIS commission on top of their own 30%. No-op if there's no
+    recruiter, the recruiter's account is paused, or the rate is zero."""
+    recruiter_id = affiliate.get("recruited_by_user_id")
+    if not recruiter_id:
+        return None
+
+    recruiter = single_data(
+        sb.table("affiliates").select("*").eq("user_id", recruiter_id).maybe_single().execute()
+    )
+    if not recruiter or recruiter["status"] != "active":
+        return None
+
+    override_rate = float(recruiter.get("override_rate") or 0)
+    if override_rate <= 0:
+        return None
+
+    override_commission = round(base_commission * override_rate, 2)
+    if override_commission <= 0:
+        return None
+
+    row = {
+        "affiliate_user_id": recruiter_id,
+        "referred_user_id": referred_user_id,
+        "source": OVERRIDE_SOURCE,
+        "amount": base_commission,
+        "commission_amount": override_commission,
+        "note": f"Override on {affiliate['code']}'s commission" + (f" — {note}" if note else ""),
+    }
+    return single_data(sb.table("affiliate_conversions").insert(row).execute())
 
 
 def record_conversion(referred_user_id: str, source: str, amount: float, note: str | None = None):
@@ -83,7 +121,9 @@ def record_conversion(referred_user_id: str, source: str, amount: float, note: s
         "commission_amount": commission,
         "note": note,
     }
-    return single_data(sb.table("affiliate_conversions").insert(row).execute())
+    created = single_data(sb.table("affiliate_conversions").insert(row).execute())
+    _credit_recruiter_override(sb, affiliate, commission, referred_user_id, note)
+    return created
 
 
 class JoinRequest(BaseModel):
@@ -105,10 +145,30 @@ async def join(body: JoinRequest):
     if existing:
         return {"affiliate": existing}
 
+    # Sub-affiliate recruiting reuses the exact same attribution already
+    # captured for customer referrals: whichever affiliate's link this
+    # person clicked (profiles.referred_by_code, first-click-wins) becomes
+    # their recruiter the moment they themselves join as an affiliate. No
+    # separate "recruiting link" — one link does both jobs.
+    recruited_by_user_id = None
+    profile = single_data(
+        sb.table("profiles").select("referred_by_code").eq("id", body.user_id).maybe_single().execute()
+    )
+    ref_code = profile.get("referred_by_code") if profile else None
+    if ref_code:
+        recruiter = single_data(
+            sb.table("affiliates").select("user_id").eq("code", ref_code).maybe_single().execute()
+        )
+        if recruiter and recruiter["user_id"] != body.user_id:
+            recruited_by_user_id = recruiter["user_id"]
+
     for _ in range(5):
         code = _generate_code(body.handle)
         try:
-            result = sb.table("affiliates").insert({"user_id": body.user_id, "code": code}).execute()
+            insert_row = {"user_id": body.user_id, "code": code}
+            if recruited_by_user_id:
+                insert_row["recruited_by_user_id"] = recruited_by_user_id
+            result = sb.table("affiliates").insert(insert_row).execute()
             return {"affiliate": single_data(result)}
         except Exception as exc:
             if "duplicate key" in str(exc).lower():
@@ -158,18 +218,32 @@ async def get_me(user_id: str):
 
     total_earned = sum(c["commission_amount"] for c in conversions)
     total_paid = sum(p["amount"] for p in payouts)
+    override_earned = sum(c["commission_amount"] for c in conversions if c.get("source") == OVERRIDE_SOURCE)
+
+    recruits = (
+        sb.table("affiliates")
+        .select("user_id, code, status, created_at")
+        .eq("recruited_by_user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
 
     return {
         "affiliate": affiliate,
         "clicks": clicks,
         "conversions": conversions,
         "payouts": payouts,
+        "recruits": recruits,
         "stats": {
             "click_count": len(clicks),
             "conversion_count": len(conversions),
             "total_earned": round(total_earned, 2),
             "total_paid": round(total_paid, 2),
             "balance_due": round(total_earned - total_paid, 2),
+            "override_earned": round(override_earned, 2),
+            "recruit_count": len(recruits),
         },
     }
 
@@ -249,11 +323,20 @@ async def admin_list(x_admin_secret: str = Header(None)):
         sb.table("affiliate_payouts").select("affiliate_user_id, amount").execute().data or []
     )
     earned_by_user = {}
+    override_by_user = {}
     for c in conversions:
         earned_by_user[c["affiliate_user_id"]] = earned_by_user.get(c["affiliate_user_id"], 0) + c["commission_amount"]
+        if c.get("source") == OVERRIDE_SOURCE:
+            override_by_user[c["affiliate_user_id"]] = override_by_user.get(c["affiliate_user_id"], 0) + c["commission_amount"]
     paid_by_user = {}
     for p in payouts:
         paid_by_user[p["affiliate_user_id"]] = paid_by_user.get(p["affiliate_user_id"], 0) + p["amount"]
+
+    recruit_counts = {}
+    for a in affiliates:
+        rid = a.get("recruited_by_user_id")
+        if rid:
+            recruit_counts[rid] = recruit_counts.get(rid, 0) + 1
 
     for a in affiliates:
         p = profiles_by_id.get(a["user_id"])
@@ -264,6 +347,10 @@ async def admin_list(x_admin_secret: str = Header(None)):
         a["total_earned"] = earned
         a["total_paid"] = paid
         a["balance_due"] = round(earned - paid, 2)
+        a["override_earned"] = round(override_by_user.get(a["user_id"], 0), 2)
+        a["recruit_count"] = recruit_counts.get(a["user_id"], 0)
+        recruiter_p = profiles_by_id.get(a.get("recruited_by_user_id"))
+        a["recruited_by_name"] = (recruiter_p.get("company_name") or recruiter_p.get("full_name")) if recruiter_p else None
 
     return {"affiliates": affiliates}
 
@@ -290,7 +377,16 @@ async def admin_detail(user_id: str, x_admin_secret: str = Header(None)):
         .data
         or []
     )
-    return {"conversions": conversions, "payouts": payouts}
+    recruits = (
+        sb.table("affiliates")
+        .select("user_id, code, status, created_at")
+        .eq("recruited_by_user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    return {"conversions": conversions, "payouts": payouts, "recruits": recruits}
 
 
 class ManualConversionRequest(BaseModel):
@@ -325,6 +421,7 @@ async def admin_log_conversion(body: ManualConversionRequest, x_admin_secret: st
         "note": body.note or None,
     }
     created = single_data(sb.table("affiliate_conversions").insert(row).execute())
+    _credit_recruiter_override(sb, affiliate, commission, None, body.note or None)
     return created
 
 
