@@ -127,8 +127,8 @@ async def start_thread(body: StartThreadRequest):
             return {"thread_id": (exact or matches[0])["id"]}
 
     try:
-        thread = single_data(sb.table("chat_threads").insert({"post_id": body.post_id}).execute())
-        thread_id = thread["id"]
+        thread_rows = sb.table("chat_threads").insert({"post_id": body.post_id}).execute().data
+        thread_id = thread_rows[0]["id"]
         sb.table("chat_thread_participants").insert([
             {"thread_id": thread_id, "user_id": body.user_id},
             {"thread_id": thread_id, "user_id": body.other_user_id},
@@ -282,7 +282,7 @@ async def send_message(thread_id: str, req: SendMessageRequest):
         "body": req.body.strip(),
         "read_by": [req.user_id],
     }
-    created = single_data(sb.table("chat_messages").insert(row).execute())
+    created = sb.table("chat_messages").insert(row).execute().data[0]
     created["reactions"] = []
     _notify_other_participants(sb, thread_id, req.user_id, req.body.strip())
     await _maybe_ai_reply(sb, thread_id, req.user_id)
@@ -427,11 +427,12 @@ async def edit_message(thread_id: str, message_id: str, req: EditMessageRequest)
     msg = _assert_sender(sb, thread_id, message_id, req.user_id)
     if msg.get("deleted_at"):
         raise HTTPException(status_code=400, detail="Cannot edit a deleted message")
-    updated = single_data(
+    updated = (
         sb.table("chat_messages")
         .update({"body": req.body.strip(), "edited_at": "now()"})
         .eq("id", message_id)
         .execute()
+        .data[0]
     )
     _attach_extras(sb, [updated])
     return updated
@@ -449,7 +450,7 @@ async def delete_message(thread_id: str, message_id: str, body: DeleteMessageReq
     sb = get_supabase()
     _assert_participant(sb, thread_id, body.user_id)
     _assert_sender(sb, thread_id, message_id, body.user_id)
-    updated = single_data(
+    updated = (
         sb.table("chat_messages")
         .update({
             "body": "",
@@ -460,6 +461,7 @@ async def delete_message(thread_id: str, message_id: str, body: DeleteMessageReq
         })
         .eq("id", message_id)
         .execute()
+        .data[0]
     )
     _attach_extras(sb, [updated])
     return updated
@@ -557,7 +559,7 @@ async def upload_attachment(thread_id: str, user_id: str = Form(...), file: Uplo
         "attachment_name": safe_name,
         "attachment_type": file.content_type,
     }
-    created = single_data(sb.table("chat_messages").insert(row).execute())
+    created = sb.table("chat_messages").insert(row).execute().data[0]
     _attach_extras(sb, [created])
     _notify_other_participants(sb, thread_id, user_id, f"📎 {safe_name}")
     return created
