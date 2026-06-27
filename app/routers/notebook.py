@@ -296,6 +296,53 @@ Existing niche keywords: {', '.join(profile.get('notebook_keywords') or []) or '
     }
 
 
+# ── AI Daily Brief (Dashboard daily feed) ────────────────────────────
+
+class DailyBriefRequest(BaseModel):
+    user_id: str
+    feed_items: list[str] = []
+
+
+DAILY_BRIEF_SYSTEM_PROMPT = """You are the FASS AI COO — a sharp, concise daily briefing voice for \
+a small business owner using the FASS Flow platform. You will be given a list of today's \
+actionable items pulled live from their account (bid deadlines, milestones, opportunity matches, \
+expiring offers, etc.) plus their business profile. Write a SHORT morning brief: 2-3 sentences, \
+plain English, no greeting (a "Good morning" header is already shown elsewhere on the page), lead \
+with the single most important or time-sensitive item, and end with one direct recommendation of \
+what to do first today. If there are no items, write one encouraging sentence pointing them toward \
+WARDOG or the Masterclass to find the next opportunity. Plain prose only — no bullet points, no \
+headers, no markdown."""
+
+
+@router.post("/daily-brief")
+async def daily_brief(body: DailyBriefRequest):
+    check_and_consume_ai_quota(body.user_id)
+    sb = get_supabase()
+    profile = single_data(
+        sb.table("business_profiles").select("*").eq("user_id", body.user_id).maybe_single().execute()
+    ) or {}
+
+    profile_block = (
+        f"Business name: {profile.get('business_name') or '(not set)'}\n"
+        f"NAICS: {profile.get('naics') or '(not set)'}\n"
+        f"Structure: {profile.get('structure') or '(not set)'}"
+    )
+    items_block = "\n".join(f"- {i}" for i in body.feed_items[:12]) or "(no urgent items today)"
+
+    prompt = f"""Business profile:
+{profile_block}
+
+Today's items pulled live from their account:
+{items_block}"""
+
+    try:
+        result = await llm_router.complete(system=DAILY_BRIEF_SYSTEM_PROMPT, prompt=prompt, max_tokens=220)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {"brief": result.text.strip(), "provider": result.provider, "model": result.model}
+
+
 # ── My Notebook page ─────────────────────────────────────────────────
 
 @router.get("/mine")
