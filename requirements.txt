@@ -12,3 +12,4 @@ python-jose[cryptography]==3.3.0
 python-multipart==0.0.9
 reportlab==4.2.0
 pywebpush==2.0.1  # Messenger browser push notifications (VAPID); no-ops if keys unset
+pypdf==4.2.0  # pure-Python PDF text extraction for WARDOG solicitation attachments, no native deps

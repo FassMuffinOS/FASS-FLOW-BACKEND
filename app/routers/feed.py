@@ -11,12 +11,22 @@ Like Team Up's partner_posts, this uses the service-role client for every
 read/write rather than letting clients query business_posts directly, since
 the feed fans out across every user's rows.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 
+from app.config import settings
 from app.database import get_supabase, single_data
 
 router = APIRouter(prefix="/feed", tags=["feed"])
+
+
+def _check_admin_secret(x_admin_secret: str | None):
+    """Same shared-secret pattern as admin.py/bd_partner.py/affiliates.py —
+    one-person ops tool, not worth a full admin-role system."""
+    if not settings.admin_secret:
+        raise HTTPException(status_code=503, detail="Admin tools not configured")
+    if not x_admin_secret or x_admin_secret != settings.admin_secret:
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
 
 
 def _attach_engagement(sb, posts: list[dict], viewer_id: str | None) -> list[dict]:
@@ -111,6 +121,75 @@ async def create_post(req: CreatePostRequest):
     }
     created = single_data(sb.table("business_posts").insert(row).execute())
     return created
+
+
+SEED_POSTS = [
+    {
+        "body": "Welcome to the FASS Flow Feed — this is where the community shares wins, "
+                 "lessons, and what's actually working in govcon right now. Land a contract? "
+                 "Close a teaming deal? Post it here.",
+        "category": "marketing",
+    },
+    {
+        "body": "Tip: run a solicitation through R-E-A-D before you sink hours into a proposal. "
+                 "A clean PURSUE/PASS call up front saves more time than any template ever will.",
+        "category": "government_readiness",
+    },
+    {
+        "body": "Looking for teaming partners? Team Up is the board for it — post your capability "
+                 "gaps or browse who else is sourcing in your NAICS.",
+        "category": "customer_growth",
+    },
+    {
+        "body": "Reminder: WARDOG now pulls the full solicitation text — including attached "
+                 "PDFs — straight into R-E-A-D, so your PURSUE/PASS decisions are grounded in "
+                 "the real requirements, not just the SAM.gov summary.",
+        "category": "operations",
+    },
+]
+
+
+@router.post("/admin/seed")
+async def seed_feed(x_admin_secret: str | None = Header(None)):
+    """One-time (but safe to re-run) tool to get the Feed past its empty
+    state. A brand-new feed with zero posts reads as a dead/abandoned
+    feature, not a quiet one — this gives every new account something real
+    to scroll past on day one while organic auto-posts (contract awarded,
+    bid submitted, R-E-A-D pursue decisions) build up.
+
+    Posted as settings.admin_user_id so they read as official FASS Flow
+    updates rather than appearing to come from a real member. Idempotent:
+    skips any seed post whose exact body already exists, so re-running this
+    (e.g. after adding a new seed message) doesn't duplicate the others.
+    """
+    _check_admin_secret(x_admin_secret)
+    if not settings.admin_user_id:
+        raise HTTPException(status_code=503, detail="admin_user_id not configured")
+
+    sb = get_supabase()
+    existing = (
+        sb.table("business_posts")
+        .select("body")
+        .eq("user_id", settings.admin_user_id)
+        .eq("source", "seed")
+        .execute()
+        .data
+        or []
+    )
+    existing_bodies = {row["body"] for row in existing}
+
+    created = []
+    for seed in SEED_POSTS:
+        if seed["body"] in existing_bodies:
+            continue
+        row = {
+            "user_id": settings.admin_user_id,
+            "body": seed["body"],
+            "source": "seed",
+            "category": seed["category"],
+        }
+        created.append(single_data(sb.table("business_posts").insert(row).execute()))
+    return {"created": len(created), "skipped": len(SEED_POSTS) - len(created)}
 
 
 @router.delete("/posts/{post_id}")
