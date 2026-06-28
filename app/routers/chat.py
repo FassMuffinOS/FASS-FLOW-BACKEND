@@ -5,11 +5,14 @@ reachable directly via people search (GET /people/search + POST
 user, not just someone who posted to the board.
 
 Threads are participant-based (chat_thread_participants), not a fixed
-user_a/user_b pair, so a thread can grow beyond two people later (e.g. a
-prime pulling in two subs on the same opportunity) without a schema change —
-but the only entry point right now (start_thread) always creates exactly two
-participants: the caller and whoever they chose (a partner post's author, or
-a person-search result).
+user_a/user_b pair, so a thread can grow beyond two people (e.g. a prime
+pulling in two subs on the same opportunity) without a schema change.
+start_thread accepts either a single other_user_id (1:1, unchanged) or
+other_user_ids (group/teaming threads, 3+ participants total once the caller
+is counted) plus an optional title for the group's display name. Existing
+threads with that exact participant set are reused either way. Participants
+can be added to an already-created thread via POST /threads/{id}/participants
+(e.g. inviting one more sub into an existing teaming conversation).
 
 Delivery is push-based: chat_messages is in the supabase_realtime publication
 (see migrations/messenger_realtime.sql) and the frontend subscribes via
@@ -185,24 +188,36 @@ async def get_chat_profile(other_user_id: str):
 
 
 class StartThreadRequest(BaseModel):
-    user_id: str        # the caller, i.e. whoever clicked "Message"
-    other_user_id: str  # the partner post's author, or a people-search result
+    user_id: str                       # the caller, i.e. whoever clicked "Message"
+    other_user_id: str | None = None   # 1:1 case — a partner post's author, or a people-search result
+    other_user_ids: list[str] = []     # group/teaming case — 2+ other people; combined with other_user_id if both are sent
     post_id: str | None = None
+    title: str | None = None           # optional group display name; ignored for 1:1 threads
 
 
 @router.post("/threads/start")
 async def start_thread(body: StartThreadRequest):
-    if body.user_id == body.other_user_id:
+    # Normalize to one recipient set regardless of which field(s) the caller
+    # used, so a single endpoint covers both the 1:1 DM picker and the
+    # "start a group" multi-select flow.
+    recipient_ids = {*body.other_user_ids}
+    if body.other_user_id:
+        recipient_ids.add(body.other_user_id)
+    recipient_ids.discard(body.user_id)
+    if not recipient_ids:
         raise HTTPException(status_code=400, detail="Cannot start a thread with yourself")
 
     sb = get_supabase()
+    participant_ids = {body.user_id, *recipient_ids}
+    is_group = len(participant_ids) > 2
+    title = body.title.strip() if (is_group and body.title and body.title.strip()) else None
 
-    # Reuse any existing thread between this exact pair of people instead of
+    # Reuse any existing thread between this exact set of people instead of
     # spawning duplicates — regardless of whether this start came from the
-    # same board post, a different post, or a fresh people-search DM. If more
-    # than one already exists (e.g. one tied to a post, one freeform), prefer
-    # the one matching this request's post_id so board-post conversations
-    # stay attached to their post.
+    # same board post, a different post, or a fresh people-search DM/group
+    # pick. If more than one already exists (e.g. one tied to a post, one
+    # freeform), prefer the one matching this request's post_id so board-post
+    # conversations stay attached to their post.
     my_thread_ids = {
         r["thread_id"]
         for r in (
@@ -225,28 +240,96 @@ async def start_thread(body: StartThreadRequest):
         )
         matches = [
             t for t in candidates
-            if {p["user_id"] for p in (t.get("chat_thread_participants") or [])} == {body.user_id, body.other_user_id}
+            if {p["user_id"] for p in (t.get("chat_thread_participants") or [])} == participant_ids
         ]
         if matches:
             exact = next((t for t in matches if t["post_id"] == body.post_id), None)
             return {"thread_id": (exact or matches[0])["id"]}
 
     try:
-        thread_rows = sb.table("chat_threads").insert({"post_id": body.post_id}).execute().data
+        thread_rows = sb.table("chat_threads").insert({"post_id": body.post_id, "title": title}).execute().data
         thread_id = thread_rows[0]["id"]
         sb.table("chat_thread_participants").insert([
-            {"thread_id": thread_id, "user_id": body.user_id},
-            {"thread_id": thread_id, "user_id": body.other_user_id},
+            {"thread_id": thread_id, "user_id": uid} for uid in participant_ids
         ]).execute()
     except Exception as e:
-        # Most common cause: other_user_id doesn't correspond to a real
-        # auth.users row (e.g. a pinned contact's env-var id is unset, typo'd,
-        # or its one-time profiles/auth provisioning was skipped) — the FK on
-        # chat_thread_participants.user_id rejects the insert. Surfacing the
-        # real detail here (instead of letting it 500 opaquely) is what makes
-        # that diagnosable from the frontend network tab.
+        # Most common cause: one of the recipient ids doesn't correspond to a
+        # real auth.users row (e.g. a pinned contact's env-var id is unset,
+        # typo'd, or its one-time profiles/auth provisioning was skipped) —
+        # the FK on chat_thread_participants.user_id rejects the insert.
+        # Surfacing the real detail here (instead of letting it 500 opaquely)
+        # is what makes that diagnosable from the frontend network tab.
         raise HTTPException(status_code=400, detail=f"Could not start thread: {e}") from e
     return {"thread_id": thread_id}
+
+
+class AddParticipantRequest(BaseModel):
+    user_id: str      # caller — must already be a participant
+    new_user_id: str
+
+
+@router.post("/threads/{thread_id}/participants")
+async def add_participant(thread_id: str, body: AddParticipantRequest):
+    """Invite one more person into an existing thread — what turns a 1:1
+    into a group, or grows an existing teaming thread (e.g. a prime pulling
+    in a second sub partway through negotiating an opportunity)."""
+    sb = get_supabase()
+    _assert_participant(sb, thread_id, body.user_id)
+
+    already = single_data(
+        sb.table("chat_thread_participants")
+        .select("user_id")
+        .eq("thread_id", thread_id)
+        .eq("user_id", body.new_user_id)
+        .maybe_single()
+        .execute()
+    )
+    if already:
+        return {"status": "ok"}
+
+    try:
+        sb.table("chat_thread_participants").insert({"thread_id": thread_id, "user_id": body.new_user_id}).execute()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not add participant: {e}") from e
+
+    adder = single_data(
+        sb.table("profiles").select("full_name").eq("id", body.user_id).maybe_single().execute()
+    )
+    adder_name = (adder or {}).get("full_name") or "Someone"
+    sb.table("chat_messages").insert({
+        "thread_id": thread_id,
+        "sender_id": body.user_id,
+        "body": f"{adder_name} added a new participant to this conversation.",
+        "read_by": [body.user_id],
+    }).execute()
+    return {"status": "ok"}
+
+
+@router.get("/threads/{thread_id}/participants")
+async def list_participants(thread_id: str, user_id: str):
+    """Full member list (with names) for a thread — used for the group info
+    panel, where a single "other participant" isn't enough once there are
+    3+ people in the conversation."""
+    sb = get_supabase()
+    _assert_participant(sb, thread_id, user_id)
+    rows = (
+        sb.table("chat_thread_participants")
+        .select("user_id, profiles(full_name, company_name)")
+        .eq("thread_id", thread_id)
+        .execute()
+        .data
+        or []
+    )
+    return {
+        "participants": [
+            {
+                "user_id": r["user_id"],
+                "full_name": (r.get("profiles") or {}).get("full_name"),
+                "company_name": (r.get("profiles") or {}).get("company_name"),
+            }
+            for r in rows
+        ]
+    }
 
 
 @router.get("/threads/mine")
@@ -309,6 +392,8 @@ async def my_threads(user_id: str):
             last = last_by_thread.get(t["id"])
             out.append({
                 "id": t["id"],
+                "title": t.get("title"),
+                "is_group": len(others) > 1,
                 "post_title": (t.get("partner_posts") or {}).get("title") if t.get("partner_posts") else None,
                 "other_participants": [
                     {"user_id": p["user_id"], "full_name": (p.get("profiles") or {}).get("full_name")}
