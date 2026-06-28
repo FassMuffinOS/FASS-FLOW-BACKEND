@@ -82,6 +82,36 @@ async def search_people(user_id: str, q: str = ""):
     return {"people": pinned + rows}
 
 
+@router.get("/profile/{other_user_id}")
+async def get_chat_profile(other_user_id: str):
+    """Verified profile panel data for a thread's other participant — same
+    underlying signal as the public /c/{slug} capability page (a published
+    FASS Wallet card = "Verified via FASS Wallet"), just looked up by user_id
+    instead of slug since that's all the thread/message rows carry. Returns
+    has_card=False (not a 404) when the person never claimed a card, so the
+    frontend can render an empty-state panel instead of treating it as an
+    error — most people in a govcon thread will have one, but not all."""
+    sb = get_supabase()
+    profile = single_data(
+        sb.table("profiles").select("full_name, company_name").eq("id", other_user_id).maybe_single().execute()
+    )
+    card = single_data(
+        sb.table("wallet_passes")
+        .select("slug, business_name, address, naics, website, phone, purchased")
+        .eq("user_id", other_user_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .maybe_single()
+        .execute()
+    )
+    return {
+        "full_name": profile.get("full_name") if profile else None,
+        "company_name": profile.get("company_name") if profile else None,
+        "has_card": bool(card),
+        "card": card,
+    }
+
+
 class StartThreadRequest(BaseModel):
     user_id: str        # the caller, i.e. whoever clicked "Message"
     other_user_id: str  # the partner post's author, or a people-search result
@@ -300,6 +330,101 @@ async def send_message(thread_id: str, req: SendMessageRequest):
     created["reactions"] = []
     _notify_other_participants(sb, thread_id, req.user_id, req.body.strip())
     await _maybe_ai_reply(sb, thread_id, req.user_id)
+    return created
+
+
+# Tables each shareable object type lives in, plus the columns pulled into
+# the message's denormalized snapshot. Keeping this as one lookup table
+# means adding a fifth shareable type later (a Pipeline record, a teaming
+# agreement, etc.) is a one-line addition here, not a new branch of
+# near-identical fetch/insert code.
+SHARE_SOURCES: dict[str, dict] = {
+    "opportunity": {
+        "table": "opportunities",
+        "fields": ["title", "agency", "naics_code", "set_aside", "value_estimate", "response_date"],
+    },
+    "proposal": {
+        "table": "proposals",
+        "fields": ["title", "status"],
+    },
+    "partner_post": {
+        "table": "partner_posts",
+        "fields": ["title", "what_i_bring", "what_i_need", "naics_code"],
+    },
+    "passport": {
+        "table": "wallet_passes",
+        "fields": ["business_name", "naics", "website", "phone", "slug"],
+        # Wallet.jsx only has the row's slug in hand (not its uuid id) —
+        # the slug is unique too, so look up by that instead of forcing
+        # the frontend to thread an extra id through just for this one type.
+        "lookup_field": "slug",
+    },
+}
+
+
+class ShareObjectRequest(BaseModel):
+    user_id: str
+    object_type: str   # one of SHARE_SOURCES keys, or "opportunity_live"
+    object_id: str
+    note: str | None = None  # optional caption the sender adds, e.g. "thoughts on this one?"
+    snapshot: dict | None = None  # required for opportunity_live; ignored otherwise
+
+
+@router.post("/threads/{thread_id}/share")
+async def share_object(thread_id: str, req: ShareObjectRequest):
+    """Drop a real platform object (opportunity, proposal, partner post, or
+    Passport capability statement) into a thread as a card instead of a
+    plain-text link. The backend reads the source row once here (service-role
+    key, so it works even if the recipient couldn't otherwise see it — sharing
+    is the access grant) and freezes a snapshot onto the message; see
+    messenger_shared_objects.sql for why this is a snapshot, not a live join.
+
+    Special case: "opportunity_live". WARDOG's search results are a live
+    SAM.gov API proxy (see wardog.py) — they're never written into
+    public.opportunities, so there's no row here to look up by id. SAM.gov
+    data is public anyway, so for this one type we trust the client-supplied
+    snapshot instead of re-fetching server-side."""
+    if req.object_type == "opportunity_live":
+        if not req.snapshot:
+            raise HTTPException(status_code=400, detail="snapshot is required for opportunity_live")
+        snapshot = req.snapshot
+        object_type_to_store = "opportunity_live"
+        sb = get_supabase()
+        _assert_participant(sb, thread_id, req.user_id)
+    else:
+        source = SHARE_SOURCES.get(req.object_type)
+        if not source:
+            raise HTTPException(status_code=400, detail=f"Unknown object_type '{req.object_type}'")
+        sb = get_supabase()
+        _assert_participant(sb, thread_id, req.user_id)
+
+        lookup_field = source.get("lookup_field", "id")
+        obj = (
+            sb.table(source["table"])
+            .select(",".join(["id"] + source["fields"]))
+            .eq(lookup_field, req.object_id)
+            .maybe_single()
+            .execute()
+        )
+        obj_data = single_data(obj)
+        if not obj_data:
+            raise HTTPException(status_code=404, detail=f"{req.object_type} not found")
+        snapshot = {f: obj_data.get(f) for f in source["fields"]}
+        object_type_to_store = req.object_type
+
+    display_title = snapshot.get("title") or snapshot.get("business_name") or req.object_type
+    row = {
+        "thread_id": thread_id,
+        "sender_id": req.user_id,
+        "body": (req.note.strip() + "\n" if req.note and req.note.strip() else "") + f"Shared: {display_title}",
+        "read_by": [req.user_id],
+        "shared_object_type": object_type_to_store,
+        "shared_object_id": req.object_id,
+        "shared_object_snapshot": snapshot,
+    }
+    created = sb.table("chat_messages").insert(row).execute().data[0]
+    created["reactions"] = []
+    _notify_other_participants(sb, thread_id, req.user_id, f"shared {display_title}")
     return created
 
 
