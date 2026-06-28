@@ -62,20 +62,92 @@ def _pinned_contacts(user_id: str) -> list[dict]:
 
 
 @router.get("/people/search")
-async def search_people(user_id: str, q: str = ""):
+async def search_people(
+    user_id: str,
+    q: str = "",
+    naics: str = "",
+    certifications: str = "",
+    min_contracts_won: int = 0,
+):
     """Platform-wide people finder for starting a new DM — deliberately not
     scoped to existing connections (Team Up posts, recruits, etc.) per the
     "find and engage with one another" ask. Matches on full_name or
     company_name; empty q returns a default browseable page rather than
     nothing, so the "New message" picker isn't a dead end before you type.
     Admin + AI Assistant are always prepended on top, unfiltered by q, so
-    they're reachable even from a totally cold/empty profiles table."""
+    they're reachable even from a totally cold/empty profiles table.
+
+    Capability filters (naics/certifications/min_contracts_won) narrow that
+    name search rather than replace it — this is the "capability-based
+    people search" ask: find subs/teammates by what they can actually do
+    (NAICS code, self-declared set-aside certs on business_profiles) or have
+    actually done (contracts won, via proposals.status='awarded'), not just
+    by name. All three are optional and additive (AND, not OR)."""
     sb = get_supabase()
+    has_capability_filter = bool(naics.strip() or certifications.strip() or min_contracts_won)
+
     query = sb.table("profiles").select("id, full_name, company_name").neq("id", user_id)
     q = q.strip()
     if q:
         query = query.or_(f"full_name.ilike.%{q}%,company_name.ilike.%{q}%")
-    rows = query.order("full_name").limit(25).execute().data or []
+    # Capability filters apply in Python below (certifications is an array
+    # column, and contracts-won needs a second-table aggregation, so neither
+    # can be pushed into the profiles query above) — pull a wider candidate
+    # page when they're active so filtering down doesn't lose real matches
+    # that just weren't in the default top-25.
+    rows = query.order("full_name").limit(200 if has_capability_filter else 25).execute().data or []
+
+    if has_capability_filter and rows:
+        candidate_ids = [r["id"] for r in rows]
+        biz_rows = (
+            sb.table("business_profiles")
+            .select("user_id, naics, certifications")
+            .in_("user_id", candidate_ids)
+            .execute()
+            .data
+            or []
+        )
+        biz_by_user = {b["user_id"]: b for b in biz_rows}
+
+        naics_q = naics.strip().lower()
+        cert_list = [c.strip().lower() for c in certifications.split(",") if c.strip()]
+
+        won_counts: dict[str, int] = {}
+        if min_contracts_won:
+            # One extra query (not per row) + a Python aggregation pass —
+            # same N+1-avoidance pattern as chat.py's unread_by_thread /
+            # feed.py's _attach_engagement.
+            won = (
+                sb.table("proposals")
+                .select("user_id")
+                .in_("user_id", candidate_ids)
+                .eq("status", "awarded")
+                .execute()
+                .data
+                or []
+            )
+            for w in won:
+                won_counts[w["user_id"]] = won_counts.get(w["user_id"], 0) + 1
+
+        def matches(r):
+            b = biz_by_user.get(r["id"])
+            if naics_q and not (b and naics_q in (b.get("naics") or "").lower()):
+                return False
+            if cert_list:
+                row_certs = [c.lower() for c in (b.get("certifications") or [])] if b else []
+                if not any(c in row_certs for c in cert_list):
+                    return False
+            if min_contracts_won and won_counts.get(r["id"], 0) < min_contracts_won:
+                return False
+            return True
+
+        rows = [r for r in rows if matches(r)]
+        for r in rows:
+            b = biz_by_user.get(r["id"]) or {}
+            r["naics"] = b.get("naics")
+            r["certifications"] = b.get("certifications") or []
+            r["contracts_won"] = won_counts.get(r["id"], 0)
+
     pinned = _pinned_contacts(user_id)
     pinned_ids = {p["id"] for p in pinned}
     rows = [r for r in rows if r["id"] not in pinned_ids]

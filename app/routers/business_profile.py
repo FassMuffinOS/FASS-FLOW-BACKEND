@@ -32,7 +32,7 @@ from app.database import get_supabase, single_data
 router = APIRouter(prefix="/business-profile", tags=["business-profile"])
 
 ENTITY_LIMITS = {"free": 1, "starter": 1, "pro": 3, "team": None}
-ENTITY_FIELDS = ("business_name", "address", "naics", "website", "phone", "structure", "biz_path", "checklist")
+ENTITY_FIELDS = ("business_name", "address", "naics", "website", "phone", "structure", "biz_path", "checklist", "certifications")
 
 
 def _entity_limit_for(plan: str | None) -> int | None:
@@ -88,6 +88,7 @@ class ProfileUpdate(BaseModel):
     structure: str | None = None
     biz_path: str | None = None
     checklist: dict | None = None
+    certifications: list[str] | None = None
 
 
 @router.post("/mine")
