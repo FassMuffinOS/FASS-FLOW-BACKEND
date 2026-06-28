@@ -204,24 +204,64 @@ READ_CATEGORIES = {
     "documentation": "Documentation & Substantiation — required past performance references, key personnel, and technical approach content.",
 }
 
-READ_SYNTHESIS_SYSTEM_PROMPT = """You are a government contracts analyst helping a small business owner \
-quickly understand what a specific solicitation requires, section by section, before they answer a \
-bid/no-bid scoring worksheet. You will be given the solicitation's raw text and a list of six \
-categories. For EACH category, write a 2-3 sentence synthesis of what THIS solicitation specifically \
-says relevant to that category — cite concrete details from the text (specific certs, NAICS, dollar \
-figures, dates, named requirements) rather than generic advice. If the text does not address a \
-category at all, say so plainly (e.g. "The text doesn't specify staffing requirements — verify directly \
-with the contracting officer.") rather than inventing anything.
+# The 18 yes/partial/no sub-questions behind R-E-A-D's six categories. The
+# frontend owns the canonical labels; these condensed versions exist so the
+# model can pre-suggest an answer per sub-question in the same call that does
+# the per-section synthesis — turning the worksheet from "fill 18 blanks" into
+# "review what's pre-filled." Deterministic answers the app can compute itself
+# (naics_match from the two NAICS codes, response_time from the due date) are
+# done client-side and OVERRIDE whatever the model suggests here.
+READ_SUBQUESTIONS = {
+    "sam_active": "SAM.gov registration is active and won't expire before award.",
+    "naics_match": "The business's NAICS code matches the solicitation's NAICS.",
+    "setaside_qual": "The business meets the set-aside qualification, or none is required.",
+    "licenses": "The business holds all required licenses, certifications, bonds, or clearances.",
+    "past_perf": "The business can demonstrate relevant past performance.",
+    "mandatory_met": "Every other mandatory qualification in the solicitation is met.",
+    "staff": "The business can staff this contract within the mobilization window.",
+    "equipment": "The business has or can acquire the required equipment/vehicles/supplies.",
+    "bandwidth": "Current workload won't prevent full-quality performance.",
+    "response_time": "There's enough time to prepare a competitive proposal before the due date.",
+    "start_date": "The performance start date is realistic to mobilize for.",
+    "period": "The period of performance is manageable.",
+    "cost_known": "The scope is clear enough to estimate costs with reasonable confidence.",
+    "margin": "At a competitive price, estimated margin is at least 12-15%.",
+    "risk": "No unusual cost risks could erase the margin.",
+    "references": "At least one strong past-performance reference is available.",
+    "personnel": "Key personnel are identified and documentable.",
+    "approach": "A specific, credible technical approach can be written (not boilerplate).",
+}
 
-Respond with ONLY a single JSON object mapping each category id to its synthesis string, with no prose \
-before or after it, e.g.:
-{"eligibility": "...", "requirements": "...", "availability": "...", "deadlines": "...", "economics": "...", "documentation": "..."}"""
+READ_SYNTHESIS_SYSTEM_PROMPT = """You are a government contracts analyst helping a small business owner \
+quickly understand a specific solicitation AND pre-fill a bid/no-bid scoring worksheet. You are given \
+the solicitation's raw text, a few facts about the business, a list of six CATEGORIES, and a list of \
+yes/partial/no SUB-QUESTIONS. Do both of the following and return them in ONE JSON object:
+
+1. "synthesis": for EACH category id, a 2-3 sentence synthesis of what THIS solicitation specifically \
+says relevant to that category — cite concrete details (specific certs, NAICS, dollar figures, dates, \
+named requirements) rather than generic advice. If the text doesn't address a category, say so plainly \
+rather than inventing anything.
+
+2. "suggestions": for EACH sub-question id, an object {"answer": "yes"|"partial"|"no"|null, \
+"confidence": "high"|"medium"|"low", "rationale": "one short sentence"}.
+   - Base answers ONLY on the solicitation text and the business facts you were given.
+   - For sub-questions about the business's INTERNAL capabilities (staffing, equipment, licenses held, \
+references, key personnel) that the given facts do NOT establish, return "answer": null, confidence \
+"low", and a rationale telling the owner what to verify. NEVER invent facts about the business.
+   - For naics_match: compare the business's NAICS to the solicitation's (exact = yes, same first 4 \
+digits = partial, different = no, either unknown = null).
+   - For timing sub-questions, reason from any dates in the text.
+
+Return ONLY the JSON object, no prose before or after, shaped exactly:
+{"synthesis": {"eligibility": "...", "requirements": "...", "availability": "...", "deadlines": "...", "economics": "...", "documentation": "..."}, "suggestions": {"sam_active": {"answer": null, "confidence": "low", "rationale": "..."}}}"""
 
 
 class ReadSynthesisRequest(BaseModel):
     solicitation_text: str
     title: str = ""
     agency: str = ""
+    business_naics: str = ""   # the user's own NAICS, to ground naics_match/eligibility
+    business_name: str = ""
     user_id: str | None = None  # used only to enforce the Lite plan's quota
 
 
@@ -232,28 +272,62 @@ async def read_synthesis(body: ReadSynthesisRequest):
     check_and_consume_ai_quota(body.user_id)
 
     categories_block = "\n".join(f"- {cid}: {desc}" for cid, desc in READ_CATEGORIES.items())
+    subs_block = "\n".join(f"- {sid}: {desc}" for sid, desc in READ_SUBQUESTIONS.items())
+    facts = []
+    if body.business_name:
+        facts.append(f"Business name: {body.business_name}")
+    if body.business_naics:
+        facts.append(f"Business NAICS code: {body.business_naics}")
+    facts_block = "\n".join(facts) or "(no business profile facts provided)"
+
     prompt = f"""Solicitation: {body.title or '(untitled)'}{f' — {body.agency}' if body.agency else ''}
+
+Business facts:
+{facts_block}
 
 Categories to synthesize:
 {categories_block}
+
+Sub-questions to suggest answers for:
+{subs_block}
 
 Solicitation text:
 {body.solicitation_text[:12000]}"""
 
     try:
         result = await llm_router.complete(system=READ_SYNTHESIS_SYSTEM_PROMPT, prompt=prompt)
-        synthesis = extract_json(result.text)
+        parsed = extract_json(result.text)
     except LLMUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=502, detail=f"Model returned unparseable output: {e}") from e
 
+    if not isinstance(parsed, dict):
+        parsed = {}
+    synthesis = parsed.get("synthesis") if isinstance(parsed.get("synthesis"), dict) else {}
+    suggestions_raw = parsed.get("suggestions") if isinstance(parsed.get("suggestions"), dict) else {}
+
     # Only return known category keys — drop anything hallucinated outside
     # the requested set rather than passing it through to the frontend.
-    clean = {cid: synthesis.get(cid, "") for cid in READ_CATEGORIES if synthesis.get(cid)}
+    clean_synth = {cid: synthesis.get(cid, "") for cid in READ_CATEGORIES if synthesis.get(cid)}
+
+    # Keep only well-formed suggestions with a real yes/partial/no answer; a
+    # null/garbage answer means "the model couldn't tell" — drop it so the
+    # frontend leaves that sub-question blank for the user instead of guessing.
+    clean_sugg = {}
+    for sid in READ_SUBQUESTIONS:
+        s = suggestions_raw.get(sid)
+        if isinstance(s, dict) and s.get("answer") in ("yes", "partial", "no"):
+            conf = s.get("confidence")
+            clean_sugg[sid] = {
+                "answer": s["answer"],
+                "confidence": conf if conf in ("high", "medium", "low") else "low",
+                "rationale": str(s.get("rationale") or "")[:300],
+            }
 
     return {
-        "synthesis": clean,
+        "synthesis": clean_synth,
+        "suggestions": clean_sugg,
         "provider": result.provider,
         "model": result.model,
     }
