@@ -343,6 +343,71 @@ Today's items pulled live from their account:
     return {"brief": result.text.strip(), "provider": result.provider, "model": result.model}
 
 
+# ── AI Chief of Staff (goal-based query across business state) ───────
+# Same shape as /daily-brief on purpose: the frontend already assembles a
+# live read of account state (dailyFeed.js's items, plus whatever extra
+# context — overdue invoices, expiring certs, inactive affiliates — the
+# caller wants to include) and hands it over as plain strings. This stays
+# a thin LLM-reasoning layer over that context instead of a second copy of
+# every Supabase query dailyFeed.js, partners.py, affiliates.py etc.
+# already do; it answers open-ended goal questions ("I need money", "what
+# should I do today") that a fixed feed list can't.
+
+class ChiefOfStaffRequest(BaseModel):
+    user_id: str
+    question: str
+    business_context: list[str] = []  # plain-text facts: open opportunities, overdue invoices, expiring certs, inactive affiliates, etc.
+
+
+CHIEF_OF_STAFF_SYSTEM_PROMPT = """You are the FASS AI Chief of Staff — a sharp, direct operating \
+partner for a small business owner using the FASS Flow platform. You are given a list of facts \
+about their business pulled live from their account (open opportunities, bid deadlines, overdue \
+invoices, expiring certifications, inactive affiliates, pipeline status, etc.) and their business \
+profile. The owner will ask a goal-oriented question — sometimes broad ("I need money", "what \
+should I grow next") and sometimes specific ("what's due this week"). Reason across the facts \
+you were given to answer it like a real chief of staff would: name the 2-4 most relevant facts, \
+explain briefly why they matter to the question, and end with one clear, concrete next action \
+naming a specific tool in FASS Flow (WARDOG, Pipeline, Witness, Foreman, Wallet, Affiliates, \
+Comms Hub, Classroom, etc.) where they should go to act on it. If the supplied facts don't \
+actually contain anything relevant to the question, say so plainly rather than inventing numbers \
+or details that weren't given to you. Keep the whole answer under 120 words, plain prose, no \
+markdown, no bullet points."""
+
+
+@router.post("/ask")
+async def ask_chief_of_staff(body: ChiefOfStaffRequest):
+    if not body.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+    check_and_consume_ai_quota(body.user_id)
+
+    sb = get_supabase()
+    profile = single_data(
+        sb.table("business_profiles").select("*").eq("user_id", body.user_id).maybe_single().execute()
+    ) or {}
+
+    profile_block = (
+        f"Business name: {profile.get('business_name') or '(not set)'}\n"
+        f"NAICS: {profile.get('naics') or '(not set)'}\n"
+        f"Structure: {profile.get('structure') or '(not set)'}"
+    )
+    context_block = "\n".join(f"- {c}" for c in body.business_context[:30]) or "(no live business facts were supplied)"
+
+    prompt = f"""Business profile:
+{profile_block}
+
+Live facts pulled from their account:
+{context_block}
+
+Owner's question: {body.question.strip()}"""
+
+    try:
+        result = await llm_router.complete(system=CHIEF_OF_STAFF_SYSTEM_PROMPT, prompt=prompt, max_tokens=320)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {"answer": result.text.strip(), "provider": result.provider, "model": result.model}
+
+
 # ── My Notebook page ─────────────────────────────────────────────────
 
 @router.get("/mine")
