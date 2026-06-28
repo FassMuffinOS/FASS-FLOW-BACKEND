@@ -525,6 +525,139 @@ Solicitation scope text:
     }
 
 
+# ── /score-opportunity ───────────────────────────────────────────────
+# WARDOG search results and the Opportunity Workspace header used to show
+# nothing about a found solicitation beyond what SAM.gov already gives you
+# (title, agency, NAICS) — a contractor opening a result had no sense of
+# whether it was actually worth their time before doing the full 18-question
+# R-E-A-D worksheet by hand. This endpoint is the "first five seconds" read:
+# given the resolved solicitation text plus what we already know about the
+# business (NAICS, certs, past performance), it produces a real fit score,
+# a rough revenue range, a win-probability/competition read, which required
+# certifications the text implies, and a short "why this opportunity"
+# explanation — grounded in the actual text, same as every other endpoint
+# in this file, never invented. R-E-A-D's worksheet remains the deliberate,
+# user-verified score; this is the fast triage score that decides whether
+# someone opens the worksheet at all.
+
+class ScoreOpportunityRequest(BaseModel):
+    solicitation_text: str
+    title: str = ""
+    agency: str = ""
+    solicitation_naics: str = ""
+    set_aside: str = ""
+    due_date: str = ""
+    award_amount: float | None = None
+    business_name: str = ""
+    business_naics: str = ""
+    business_certifications: list[str] = []
+    past_performance: list[PastPerformanceItem] = []
+    user_id: str | None = None  # used only to enforce the Lite plan's quota
+
+
+SCORE_OPPORTUNITY_SYSTEM_PROMPT = """You are a government contracts analyst giving a small \
+business owner a fast, honest "should I even look at this?" read on a solicitation, BEFORE they \
+spend time on a full bid/no-bid worksheet. You are given the solicitation text, basic facts about \
+the solicitation (NAICS, set-aside, due date, award ceiling if known), and facts about the \
+business (their NAICS, certifications they hold, past performance). Return a SINGLE JSON object, \
+no prose before or after it:
+
+{
+  "fit_score": number 0-100,        // overall fit: NAICS match, set-aside eligibility, scope match to past performance, certs held vs required
+  "fit_label": "strong fit" | "good fit" | "stretch" | "poor fit",
+  "win_probability": number 0-100,  // realistic chance of winning if they bid, given competition level and how well-matched they are — NOT the same number as fit_score
+  "competition_level": "low" | "medium" | "high",
+  "competition_reason": string,     // 1 sentence: what in the text/set-aside/scope suggests this competition level
+  "estimated_revenue": {
+    "low": number or null,          // rough total contract value range; null if the text/award ceiling gives no basis
+    "high": number or null,
+    "basis": string                 // what the range is based on (award ceiling stated, scope size, period of performance) or why it's null
+  },
+  "required_certifications": [string],  // certs/registrations/clearances/bonds the text explicitly or implicitly requires
+  "ai_summary": string,             // 2-3 plain sentences: what this contract actually is and whether it's worth pursuing
+  "why_bullets": [string],          // 3-5 short bullets, each a CONCRETE reason this is or isn't a good match (cite specific NAICS/cert/past-performance/scope facts, not generic advice)
+  "risk_flags": [string]            // things that would hurt this business's odds or effort if they bid (missing cert, thin past performance, tight timeline, unclear scope)
+}
+
+Ground every field in the solicitation text and the business facts given — if a business fact \
+(certifications, past performance) isn't provided, say so in why_bullets/risk_flags rather than \
+assuming the business lacks or has it. Do not invent dollar values, certifications, or NAICS codes \
+that aren't in the text. Respond with ONLY the JSON object."""
+
+
+@router.post("/score-opportunity")
+async def score_opportunity(body: ScoreOpportunityRequest):
+    if not body.solicitation_text.strip():
+        raise HTTPException(status_code=400, detail="solicitation_text is required")
+    check_and_consume_ai_quota(body.user_id)
+
+    pp_lines = [
+        f"- {pp.contract or pp.description} ({pp.client}, {pp.period})".strip()
+        for pp in body.past_performance
+        if pp.contract or pp.description
+    ] or ["(none on file)"]
+
+    facts = f"""Solicitation facts:
+Title: {body.title or '(untitled)'}
+Agency: {body.agency or '(not provided)'}
+Solicitation NAICS: {body.solicitation_naics or '(not provided)'}
+Set-aside: {body.set_aside or '(none stated)'}
+Due date: {body.due_date or '(not provided)'}
+Award ceiling: {f"${body.award_amount:,.0f}" if body.award_amount else "(not stated)"}
+
+Business facts:
+Name: {body.business_name or '(not provided)'}
+NAICS: {body.business_naics or '(not provided)'}
+Certifications held: {", ".join(body.business_certifications) if body.business_certifications else "(none on file)"}
+Past performance on file:
+{chr(10).join(pp_lines)}"""
+
+    prompt = f"""{facts}
+
+Solicitation text:
+{body.solicitation_text[:12000]}"""
+
+    try:
+        result = await llm_router.complete(
+            system=SCORE_OPPORTUNITY_SYSTEM_PROMPT, prompt=prompt, max_tokens=1400
+        )
+        fields = extract_json(result.text)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"Model returned unparseable output: {e}") from e
+
+    required_certs = [str(c) for c in (fields.get("required_certifications") or [])]
+    held = {c.strip().lower() for c in body.business_certifications}
+    # Deterministic diff, not left to the model: a cert is a "gap" only if it's
+    # required and genuinely absent from the held list (case-insensitive,
+    # substring match since solicitations phrase certs inconsistently, e.g.
+    # "8(a)" vs "SBA 8(a) certified").
+    cert_gaps = [c for c in required_certs if not any(h in c.lower() or c.lower() in h for h in held)]
+
+    revenue = fields.get("estimated_revenue") or {}
+
+    return {
+        "fit_score": fields.get("fit_score"),
+        "fit_label": fields.get("fit_label", ""),
+        "win_probability": fields.get("win_probability"),
+        "competition_level": fields.get("competition_level", ""),
+        "competition_reason": fields.get("competition_reason", ""),
+        "estimated_revenue": {
+            "low": revenue.get("low"),
+            "high": revenue.get("high"),
+            "basis": revenue.get("basis", ""),
+        },
+        "required_certifications": required_certs,
+        "cert_gaps": cert_gaps,
+        "ai_summary": fields.get("ai_summary", ""),
+        "why_bullets": [str(b) for b in (fields.get("why_bullets") or [])],
+        "risk_flags": [str(r) for r in (fields.get("risk_flags") or [])],
+        "provider": result.provider,
+        "model": result.model,
+    }
+
+
 # ── /extract-from-image ──────────────────────────────────────────────
 # Continuity feature for WARDOG's "Other Sources" directory: FedConnect,
 # Unison Marketplace, and DIBBS sit behind vendor logins, so a server-side
