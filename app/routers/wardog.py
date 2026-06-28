@@ -28,12 +28,14 @@ SAM_SEARCH_URL = "https://api.sam.gov/opportunities/v2/search"
 # what's actually available.
 SAM_MAX_LIMIT = 1000
 
-# SAM.gov also rejects any postedFrom/postedTo span wider than 1 year — a
-# hard ceiling on their side, not ours. We default to the full 365 days
-# (instead of the old hardcoded 30) so a single search surfaces everything
-# postable, while still letting callers request a narrower window.
-SAM_MAX_DATE_SPAN_DAYS = 365
-DEFAULT_DATE_SPAN_DAYS = 365
+# SAM.gov rejects any postedFrom/postedTo span of 1 year or more — their API
+# error is literally "Date range must be null year(s) apart" when the span
+# hits exactly 365 days, so the real ceiling is 364, not 365. We default to
+# the full 364 days (instead of the old hardcoded 30) so a single search
+# surfaces everything postable, while still letting callers request a
+# narrower window.
+SAM_MAX_DATE_SPAN_DAYS = 364
+DEFAULT_DATE_SPAN_DAYS = 364
 
 
 @router.get("/search")
