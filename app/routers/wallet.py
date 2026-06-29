@@ -27,15 +27,24 @@ Flow:
      behind the QR code on the physical pass (flow.fass.systems/c/{slug}):
      deliberately public, the whole point of scanning it. Only ever
      returns marketing-safe fields — no stripe_session_id, no user_id.
+
+2026-06-29 security fix: /mine, /checkout, /free, and /customize now
+require the caller to be logged in as the pass's owning user_id (/customize
+only carries a slug, so its row is looked up first to resolve the owner).
+/pass, /public/{slug}, and /purchase-status/{slug} stay open by design —
+they're the public QR-target/polling endpoints described above and only
+ever expose marketing-safe fields or a boolean.
 """
 import re
 import uuid
 
 import stripe
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 from app.services.apns import notify_devices
@@ -91,7 +100,11 @@ class CheckoutRequest(BaseModel):
 
 
 @router.post("/checkout")
-async def create_wallet_checkout(body: CheckoutRequest):
+async def create_wallet_checkout(body: CheckoutRequest, current_user: CurrentUser = Depends(get_current_user)):
+    # 2026-06-29 security fix: previously took user_id at face value — anyone
+    # could start (or silently overwrite, via the slug-match branch below) a
+    # checkout session attributed to another user's account.
+    require_owner(current_user, body.user_id, detail="You can only manage your own wallet checkout")
     if not settings.stripe_price_wallet:
         raise HTTPException(status_code=503, detail="Wallet checkout not configured")
 
@@ -175,10 +188,14 @@ class FreeClaimRequest(BaseModel):
 
 
 @router.post("/free")
-async def claim_free_wallet_pass(body: FreeClaimRequest):
+async def claim_free_wallet_pass(body: FreeClaimRequest, current_user: CurrentUser = Depends(get_current_user)):
     """The actual test-drive path: a real, signed .pkpass, right now, no
     Stripe. purchased stays false, so /pass renders it with the FASS
-    watermark until the same slug gets upgraded through /checkout."""
+    watermark until the same slug gets upgraded through /checkout.
+
+    2026-06-29 security fix: previously took user_id at face value — anyone
+    could mint a free pass row attributed to another user's account."""
+    require_owner(current_user, body.user_id, detail="You can only claim a wallet card for your own account")
     sb = get_supabase()
     slug = _slugify(body.business_name)
     row = {
@@ -203,12 +220,17 @@ async def claim_free_wallet_pass(body: FreeClaimRequest):
 
 
 @router.get("/mine")
-async def get_my_wallet_pass(user_id: str = Query(..., min_length=1)):
+async def get_my_wallet_pass(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
     """Lets Passport reload a user's existing card (design + purchase state)
     on page load instead of starting from scratch every time — the whole
     point of a "view your current card" experience instead of a one-shot
     wizard. Returns the most recently created row for that user, or 404 if
-    they've never started a card."""
+    they've never started a card.
+
+    2026-06-29: now requires the caller to be logged in as user_id — this
+    previously returned any user's card design data to anyone who supplied
+    their user_id."""
+    require_owner(current_user, user_id, detail="You can only view your own wallet card")
     sb = get_supabase()
     record = single_data(
         sb.table("wallet_passes")
@@ -239,14 +261,25 @@ class CustomizeRequest(BaseModel):
 
 
 @router.post("/customize")
-async def customize_wallet_pass(body: CustomizeRequest):
+async def customize_wallet_pass(body: CustomizeRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Updates a card's design after the wallet_passes row already exists —
     before OR after purchase. generate_pkpass() always reads bg_color/logo_url/
     show_* fresh off the row at download time, so this is enough to change
     the look of an already-purchased pass: just re-download /pass?slug=...
     afterward to get the updated .pkpass. No Stripe involved here — design
-    changes stay free forever, only the original unlock was paywalled."""
+    changes stay free forever, only the original unlock was paywalled.
+
+    2026-06-29 security fix: this request only carries a slug, not a
+    user_id, so ownership has to be resolved by looking the row up first —
+    previously anyone who knew/guessed a slug could redesign someone else's
+    card."""
     sb = get_supabase()
+    owner = single_data(
+        sb.table("wallet_passes").select("user_id").eq("slug", body.slug).maybe_single().execute()
+    )
+    if not owner:
+        raise HTTPException(status_code=404, detail="No wallet pass found for that slug")
+    require_owner(current_user, owner["user_id"], detail="You can only customize your own wallet card")
     update = {
         "bg_color": body.bg_color or "#240e41",
         "card_style": body.card_style or "classic",

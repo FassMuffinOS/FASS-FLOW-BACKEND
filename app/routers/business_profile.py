@@ -24,9 +24,10 @@ end. Switching the active entity (or creating/deleting one) just re-mirrors
 into business_profiles. Entity counts are capped per plan: Free/Core = 1,
 Pro = 3, Team = unlimited.
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 
 router = APIRouter(prefix="/business-profile", tags=["business-profile"])
@@ -68,7 +69,8 @@ def _get_or_create_active_entity(sb, user_id: str) -> dict:
 
 
 @router.get("/mine")
-async def get_my_profile(user_id: str = Query(..., min_length=1)):
+async def get_my_profile(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own business profile")
     sb = get_supabase()
     profile = single_data(
         sb.table("business_profiles").select("*").eq("user_id", user_id).maybe_single().execute()
@@ -92,13 +94,14 @@ class ProfileUpdate(BaseModel):
 
 
 @router.post("/mine")
-async def upsert_my_profile(body: ProfileUpdate):
+async def upsert_my_profile(body: ProfileUpdate, current_user: CurrentUser = Depends(get_current_user)):
     """Partial merge upsert keyed on user_id. Only fields the caller
     actually set are applied (pydantic's exclude_unset), so e.g. Start
     Business saving a checklist toggle never wipes out the business_name
     Wallet already wrote. checklist itself merges key-by-key on top of
     that, since it's the one field multiple wizard steps write to
     incrementally rather than all at once."""
+    require_owner(current_user, body.user_id, detail="You can only edit your own business profile")
     sb = get_supabase()
     existing = (
         single_data(
@@ -132,7 +135,8 @@ async def upsert_my_profile(body: ProfileUpdate):
 
 
 @router.get("/entities")
-async def list_entities(user_id: str = Query(..., min_length=1)):
+async def list_entities(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own businesses")
     sb = get_supabase()
     _get_or_create_active_entity(sb, user_id)  # ensure at least one exists
 
@@ -148,7 +152,8 @@ class CreateEntity(BaseModel):
 
 
 @router.post("/entities")
-async def create_entity(body: CreateEntity):
+async def create_entity(body: CreateEntity, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only create businesses under your own account")
     sb = get_supabase()
     profile = single_data(sb.table("profiles").select("plan").eq("id", body.user_id).maybe_single().execute()) or {}
     limit = _entity_limit_for(profile.get("plan"))
@@ -175,7 +180,8 @@ async def create_entity(body: CreateEntity):
 
 
 @router.post("/entities/{entity_id}/activate")
-async def activate_entity(entity_id: str, user_id: str = Query(..., min_length=1)):
+async def activate_entity(entity_id: str, user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only manage your own businesses")
     sb = get_supabase()
     entity = single_data(
         sb.table("business_entities").select("*").eq("id", entity_id).eq("user_id", user_id).maybe_single().execute()
@@ -190,7 +196,8 @@ async def activate_entity(entity_id: str, user_id: str = Query(..., min_length=1
 
 
 @router.delete("/entities/{entity_id}")
-async def delete_entity(entity_id: str, user_id: str = Query(..., min_length=1)):
+async def delete_entity(entity_id: str, user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only manage your own businesses")
     sb = get_supabase()
     all_entities = sb.table("business_entities").select("*").eq("user_id", user_id).execute().data or []
     if len(all_entities) <= 1:

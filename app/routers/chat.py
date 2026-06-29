@@ -24,13 +24,22 @@ append" signal.
 import logging
 import uuid
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 from app.services.llm import LLMUnavailableError, llm_router
 from app.web_push import send_push_to_user
+
+# 2026-06-29 security fix: every endpoint below took a caller-supplied
+# user_id at face value. _assert_participant only checked that the *claimed*
+# user_id was a thread member, not that the caller actually was that user —
+# anyone who knew (or guessed) a participant's id could read/post/delete in
+# any thread they were never part of. Every endpoint that accepts a user_id
+# now also depends on get_current_user and calls require_owner to verify the
+# claimed id matches the authenticated session before doing anything else.
 
 logger = logging.getLogger("fass_flow.chat")
 
@@ -71,7 +80,9 @@ async def search_people(
     naics: str = "",
     certifications: str = "",
     min_contracts_won: int = 0,
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    require_owner(current_user, user_id, detail="user_id must match the logged-in caller")
     """Platform-wide people finder for starting a new DM — deliberately not
     scoped to existing connections (Team Up posts, recruits, etc.) per the
     "find and engage with one another" ask. Matches on full_name or
@@ -196,7 +207,8 @@ class StartThreadRequest(BaseModel):
 
 
 @router.post("/threads/start")
-async def start_thread(body: StartThreadRequest):
+async def start_thread(body: StartThreadRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="user_id must match the logged-in caller")
     # Normalize to one recipient set regardless of which field(s) the caller
     # used, so a single endpoint covers both the 1:1 DM picker and the
     # "start a group" multi-select flow.
@@ -269,10 +281,11 @@ class AddParticipantRequest(BaseModel):
 
 
 @router.post("/threads/{thread_id}/participants")
-async def add_participant(thread_id: str, body: AddParticipantRequest):
+async def add_participant(thread_id: str, body: AddParticipantRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Invite one more person into an existing thread — what turns a 1:1
     into a group, or grows an existing teaming thread (e.g. a prime pulling
     in a second sub partway through negotiating an opportunity)."""
+    require_owner(current_user, body.user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     _assert_participant(sb, thread_id, body.user_id)
 
@@ -306,10 +319,11 @@ async def add_participant(thread_id: str, body: AddParticipantRequest):
 
 
 @router.get("/threads/{thread_id}/participants")
-async def list_participants(thread_id: str, user_id: str):
+async def list_participants(thread_id: str, user_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Full member list (with names) for a thread — used for the group info
     panel, where a single "other participant" isn't enough once there are
     3+ people in the conversation."""
+    require_owner(current_user, user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     _assert_participant(sb, thread_id, user_id)
     rows = (
@@ -333,7 +347,7 @@ async def list_participants(thread_id: str, user_id: str):
 
 
 @router.get("/threads/mine")
-async def my_threads(user_id: str):
+async def my_threads(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Inbox list: every thread the user's in, with the other participant(s),
     the linked post (if any), and the most recent message for a preview line.
 
@@ -343,6 +357,7 @@ async def my_threads(user_id: str):
     Before this, a failure here meant the sidebar just looked permanently
     empty with zero trace in the logs — same failure mode start_thread had
     before it got the same treatment."""
+    require_owner(current_user, user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     try:
         my_rows = (
@@ -416,7 +431,8 @@ async def my_threads(user_id: str):
 
 
 @router.get("/threads/{thread_id}/messages")
-async def get_messages(thread_id: str, user_id: str):
+async def get_messages(thread_id: str, user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     _assert_participant(sb, thread_id, user_id)
     rows = (
@@ -472,7 +488,8 @@ class SendMessageRequest(BaseModel):
 
 
 @router.post("/threads/{thread_id}/messages")
-async def send_message(thread_id: str, req: SendMessageRequest):
+async def send_message(thread_id: str, req: SendMessageRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, req.user_id, detail="user_id must match the logged-in caller")
     if not req.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     sb = get_supabase()
@@ -528,7 +545,7 @@ class ShareObjectRequest(BaseModel):
 
 
 @router.post("/threads/{thread_id}/share")
-async def share_object(thread_id: str, req: ShareObjectRequest):
+async def share_object(thread_id: str, req: ShareObjectRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Drop a real platform object (opportunity, proposal, partner post, or
     Passport capability statement) into a thread as a card instead of a
     plain-text link. The backend reads the source row once here (service-role
@@ -541,6 +558,7 @@ async def share_object(thread_id: str, req: ShareObjectRequest):
     public.opportunities, so there's no row here to look up by id. SAM.gov
     data is public anyway, so for this one type we trust the client-supplied
     snapshot instead of re-fetching server-side."""
+    require_owner(current_user, req.user_id, detail="user_id must match the logged-in caller")
     if req.object_type == "opportunity_live":
         if not req.snapshot:
             raise HTTPException(status_code=400, detail="snapshot is required for opportunity_live")
@@ -695,10 +713,11 @@ class MarkReadRequest(BaseModel):
 
 
 @router.post("/threads/{thread_id}/read")
-async def mark_read(thread_id: str, body: MarkReadRequest):
+async def mark_read(thread_id: str, body: MarkReadRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Appends user_id to read_by on every message in the thread that doesn't
     already have it — simple unread-count support without a separate
     per-user read-cursor table."""
+    require_owner(current_user, body.user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     _assert_participant(sb, thread_id, body.user_id)
     rows = (
@@ -722,7 +741,8 @@ class EditMessageRequest(BaseModel):
 
 
 @router.patch("/threads/{thread_id}/messages/{message_id}")
-async def edit_message(thread_id: str, message_id: str, req: EditMessageRequest):
+async def edit_message(thread_id: str, message_id: str, req: EditMessageRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, req.user_id, detail="user_id must match the logged-in caller")
     if not req.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     sb = get_supabase()
@@ -746,10 +766,11 @@ class DeleteMessageRequest(BaseModel):
 
 
 @router.delete("/threads/{thread_id}/messages/{message_id}")
-async def delete_message(thread_id: str, message_id: str, body: DeleteMessageRequest):
+async def delete_message(thread_id: str, message_id: str, body: DeleteMessageRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Soft-delete: the row stays (so thread ordering / read receipts don't
     shift) but body + any attachment fields are cleared. The frontend
     renders a 'message deleted' placeholder for rows with deleted_at set."""
+    require_owner(current_user, body.user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     _assert_participant(sb, thread_id, body.user_id)
     _assert_sender(sb, thread_id, message_id, body.user_id)
@@ -792,10 +813,11 @@ class ReactionRequest(BaseModel):
 
 
 @router.post("/messages/{message_id}/reactions")
-async def toggle_reaction(message_id: str, body: ReactionRequest):
+async def toggle_reaction(message_id: str, body: ReactionRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Toggle semantics: if this user already reacted with this emoji on
     this message, remove it; otherwise add it. One POST covers both react
     and un-react so the frontend doesn't need to track which call to make."""
+    require_owner(current_user, body.user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     msg = single_data(
         sb.table("chat_messages").select("thread_id").eq("id", message_id).maybe_single().execute()
@@ -835,10 +857,11 @@ async def toggle_reaction(message_id: str, body: ReactionRequest):
 
 
 @router.post("/threads/{thread_id}/attachments")
-async def upload_attachment(thread_id: str, user_id: str = Form(...), file: UploadFile = File(...)):
+async def upload_attachment(thread_id: str, user_id: str = Form(...), file: UploadFile = File(...), current_user: CurrentUser = Depends(get_current_user)):
     """Uploads to the private chat-attachments bucket under
     {thread_id}/{uuid}-{filename}, then creates the chat_messages row in
     the same call (an attachment is just a message with no body text)."""
+    require_owner(current_user, user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     _assert_participant(sb, thread_id, user_id)
 
@@ -876,11 +899,12 @@ class PushSubscribeRequest(BaseModel):
 
 
 @router.post("/push/subscribe")
-async def push_subscribe(body: PushSubscribeRequest):
+async def push_subscribe(body: PushSubscribeRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Registers (or refreshes) a browser's Web Push subscription. Frontend
     calls this right after Notification.requestPermission() + a successful
     pushManager.subscribe(). Upsert on endpoint so re-subscribing the same
     browser doesn't create duplicate rows."""
+    require_owner(current_user, body.user_id, detail="user_id must match the logged-in caller")
     sb = get_supabase()
     sb.table("push_subscriptions").upsert({
         "user_id": body.user_id,
@@ -896,7 +920,10 @@ class PushUnsubscribeRequest(BaseModel):
 
 
 @router.post("/push/unsubscribe")
-async def push_unsubscribe(body: PushUnsubscribeRequest):
+async def push_unsubscribe(body: PushUnsubscribeRequest, current_user: CurrentUser = Depends(get_current_user)):
+    # No per-row ownership check here (the request carries only the opaque
+    # push endpoint URL, not a user_id) — requiring a valid session at least
+    # rules out an anonymous caller mass-unsubscribing guessed endpoints.
     sb = get_supabase()
     sb.table("push_subscriptions").delete().eq("endpoint", body.endpoint).execute()
     return {"status": "ok"}

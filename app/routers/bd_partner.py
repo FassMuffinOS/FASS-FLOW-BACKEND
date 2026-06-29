@@ -14,9 +14,10 @@ admin-secret-gated endpoints below, mirroring admin.py's pattern exactly
 (this is a one-person white-glove service, not something that needs a
 full admin-role system yet).
 """
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 
@@ -69,7 +70,11 @@ async def list_clients(x_admin_secret: str = Header(None)):
 
 
 @router.get("/status")
-async def get_status(user_id: str):
+async def get_status(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    # 2026-06-29 security fix: previously had no auth check at all — not
+    # even the admin shared-secret used elsewhere in this file — so anyone
+    # could read whether any user_id was an active BD Partner client.
+    require_owner(current_user, user_id, detail="You can only view your own BD Partner status")
     sb = get_supabase()
     client = single_data(
         sb.table("bd_partner_clients").select("*").eq("user_id", user_id).maybe_single().execute()
@@ -78,7 +83,11 @@ async def get_status(user_id: str):
 
 
 @router.get("/activity")
-async def get_activity(user_id: str, limit: int = 100):
+async def get_activity(user_id: str, limit: int = 100, current_user: CurrentUser = Depends(get_current_user)):
+    # 2026-06-29 security fix: previously had no auth check — anyone could
+    # read another client's private BD Partner activity log (alerts,
+    # proposal drafts, call notes) by supplying their user_id.
+    require_owner(current_user, user_id, detail="You can only view your own BD Partner activity")
     sb = get_supabase()
     rows = (
         sb.table("bd_partner_activity")

@@ -11,21 +11,36 @@ iMessage; the table/schema still distinguishes channel ('imessage' vs
 path without a schema change — see app/services/twilio_sms.py and the
 mac-relay scripts for that path.
 
-Ownership model matches every other router here: no auth dependency, the
-caller's business_user_id is taken at face value and the service-role
-client is used for every read/write.
+2026-06-29 security fix: this previously had no auth dependency anywhere —
+caller-supplied business_user_id was taken at face value, so anyone could
+read or send SMS as any business. User-scoped endpoints (/send, /threads,
+/contact, /thread, /contact/dismiss-nudge) now require the caller to be
+logged in as that business_user_id. /outbox and /outbox/{id}/ack are the
+Mac relay's internal polling endpoints (no specific business context —
+they see the global send queue), so they're gated behind the same
+shared-secret pattern admin.py uses instead of a user session. /twilio/inbound
+stays open with no auth — it's Twilio's own webhook target and Twilio
+doesn't send a bearer token.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 from app.services.twilio_sms import send_sms
 
 router = APIRouter(prefix="/comms", tags=["comms"])
+
+
+def _check_relay_secret(x_admin_secret: str | None):
+    """Same fail-closed pattern as admin.py: if ADMIN_SECRET isn't set in
+    this environment, the relay endpoints are disabled rather than open."""
+    if not settings.admin_secret or not x_admin_secret or x_admin_secret != settings.admin_secret:
+        raise HTTPException(status_code=403, detail="Not authorized")
 
 NUDGE_QUIET_DAYS = 30
 
@@ -39,7 +54,8 @@ class SendRequest(BaseModel):
 
 
 @router.post("/send")
-async def send_message(body: SendRequest):
+async def send_message(body: SendRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.business_user_id, detail="You can only send messages for your own business")
     if not body.phone.strip() or not body.body.strip():
         raise HTTPException(status_code=400, detail="phone and body are required")
 
@@ -75,9 +91,16 @@ async def send_message(body: SendRequest):
 
 
 @router.get("/outbox")
-async def get_outbox(limit: int = 25):
+async def get_outbox(limit: int = 25, x_admin_secret: str | None = Header(None)):
     """Polled by the Mac relay. Returns the oldest queued messages first so
-    nothing waits forever behind a burst of newer sends."""
+    nothing waits forever behind a burst of newer sends.
+
+    2026-06-29 security fix: this returns ALL businesses' queued outbound
+    messages with zero scoping — there's no per-business filter here by
+    design (the relay polls one global queue). Previously had no auth at
+    all; now gated behind the same shared admin-secret header admin.py
+    uses, since the caller is the relay script, not a logged-in user."""
+    _check_relay_secret(x_admin_secret)
     sb = get_supabase()
     rows = (
         sb.table("comms_messages")
@@ -100,7 +123,8 @@ class AckRequest(BaseModel):
 
 
 @router.post("/outbox/{message_id}/ack")
-async def ack_outbox(message_id: str, body: AckRequest):
+async def ack_outbox(message_id: str, body: AckRequest, x_admin_secret: str | None = Header(None)):
+    _check_relay_secret(x_admin_secret)
     if body.status not in ("sent", "failed"):
         raise HTTPException(status_code=400, detail="status must be 'sent' or 'failed'")
 
@@ -161,7 +185,7 @@ async def receive_twilio_inbound(request: Request):
 
 
 @router.get("/threads")
-async def list_threads(business_user_id: str):
+async def list_threads(business_user_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """One row per phone number, most recently active first — the contact
     list view. Pulled in one query and folded down in Python since Supabase
     doesn't have a clean "latest row per group" without a view/RPC, and
@@ -173,6 +197,7 @@ async def list_threads(business_user_id: str):
     that's gone quiet but already covered (awarded, declined, off-cycle) can
     be dismissed server-side via nudge_dismissed_until and stay dismissed
     across devices."""
+    require_owner(current_user, business_user_id, detail="You can only view your own message threads")
     sb = get_supabase()
     rows = (
         sb.table("comms_messages")
@@ -241,7 +266,8 @@ class ContactRequest(BaseModel):
 
 
 @router.get("/contact")
-async def get_contact(business_user_id: str, phone: str):
+async def get_contact(business_user_id: str, phone: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, business_user_id, detail="You can only view your own contacts")
     sb = get_supabase()
     contact = single_data(
         sb.table("comms_contacts")
@@ -255,7 +281,8 @@ async def get_contact(business_user_id: str, phone: str):
 
 
 @router.put("/contact")
-async def upsert_contact(body: ContactRequest):
+async def upsert_contact(body: ContactRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.business_user_id, detail="You can only edit your own contacts")
     sb = get_supabase()
     row = {
         "business_user_id": body.business_user_id,
@@ -278,10 +305,11 @@ class DismissNudgeRequest(BaseModel):
 
 
 @router.post("/contact/dismiss-nudge")
-async def dismiss_nudge(body: DismissNudgeRequest):
+async def dismiss_nudge(body: DismissNudgeRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Soft-snooze a quiet-contact nudge — used when the relationship is
     intentionally dormant (already awarded, declined, off-cycle) so it stops
     resurfacing without requiring you to message someone just to silence it."""
+    require_owner(current_user, body.business_user_id, detail="You can only manage your own contacts")
     sb = get_supabase()
     from datetime import timedelta
 
@@ -297,7 +325,8 @@ async def dismiss_nudge(body: DismissNudgeRequest):
 
 
 @router.get("/thread")
-async def get_thread(business_user_id: str, phone: str):
+async def get_thread(business_user_id: str, phone: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, business_user_id, detail="You can only view your own message threads")
     sb = get_supabase()
     rows = (
         sb.table("comms_messages")

@@ -42,9 +42,10 @@ import re
 import uuid
 
 import stripe
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 from app.services.apns import notify_devices
@@ -75,7 +76,8 @@ class IssueGiftCardRequest(BaseModel):
 
 
 @router.post("/issue")
-async def issue_gift_card(body: IssueGiftCardRequest):
+async def issue_gift_card(body: IssueGiftCardRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.business_user_id, detail="You can only issue gift cards for your own business")
     if body.value <= 0:
         raise HTTPException(status_code=400, detail="Gift card value must be greater than $0")
 
@@ -94,7 +96,8 @@ async def issue_gift_card(body: IssueGiftCardRequest):
 
 
 @router.get("/mine")
-async def list_my_gift_cards(user_id: str = Query(..., min_length=1)):
+async def list_my_gift_cards(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own gift card program")
     sb = get_supabase()
     cards = (
         sb.table("gift_cards")
@@ -145,9 +148,16 @@ async def get_gift_card_pass(slug: str = Query(..., min_length=1)):
 
 
 @router.get("/lookup")
-async def lookup_gift_card(slug: str = Query(..., min_length=1), business_user_id: str = Query(..., min_length=1)):
+async def lookup_gift_card(
+    slug: str = Query(..., min_length=1),
+    business_user_id: str = Query(..., min_length=1),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """Backs the staff redemption confirm page — shown after scanning a
-    customer's gift card QR, before any amount is actually redeemed."""
+    customer's gift card QR, before any amount is actually redeemed. Staff
+    must be logged in as the business that issued the card; this is a
+    balance-revealing lookup, not public storefront data."""
+    require_owner(current_user, business_user_id, detail="This gift card belongs to a different business")
     sb = get_supabase()
     card = single_data(
         sb.table("gift_cards")
@@ -177,7 +187,13 @@ class RedeemGiftCardRequest(BaseModel):
 
 
 @router.post("/redeem")
-async def redeem_gift_card(body: RedeemGiftCardRequest):
+async def redeem_gift_card(body: RedeemGiftCardRequest, current_user: CurrentUser = Depends(get_current_user)):
+    # 2026-06-29 security fix: this previously trusted body.business_user_id
+    # with no login check at all — anyone who knew a card's slug + the
+    # business's user_id (itself exposed by the public /business lookup)
+    # could drain its balance remotely. Now the caller must be logged in
+    # as the business that owns the card.
+    require_owner(current_user, body.business_user_id, detail="This gift card belongs to a different business")
     if body.amount <= 0:
         raise HTTPException(status_code=400, detail="Redemption amount must be greater than $0")
 
@@ -217,11 +233,16 @@ async def redeem_gift_card(body: RedeemGiftCardRequest):
 
 
 @router.get("/history")
-async def gift_card_history(slug: str = Query(..., min_length=1), business_user_id: str = Query(..., min_length=1)):
+async def gift_card_history(
+    slug: str = Query(..., min_length=1),
+    business_user_id: str = Query(..., min_length=1),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """Per-card transaction log for the dashboard — every partial/full
     redemption against this card, newest first. Ownership-checked the same
     way /lookup is, since this exposes how a specific customer has been
     using their balance."""
+    require_owner(current_user, business_user_id, detail="This gift card belongs to a different business")
     sb = get_supabase()
     card = single_data(
         sb.table("gift_cards").select("slug, business_user_id").eq("slug", slug).maybe_single().execute()
