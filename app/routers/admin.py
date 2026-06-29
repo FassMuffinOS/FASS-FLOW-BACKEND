@@ -14,6 +14,11 @@ than a full admin-role system, since this is a one-person ops tool.
 Do not expose this secret in the frontend bundle — it's typed in by
 hand each session, never committed, never logged.
 """
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, EmailStr
 from app.config import settings
@@ -22,6 +27,12 @@ from app.database import get_supabase
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 ALLOWED_PLANS = {"starter", "pro", "team", "promo"}
+
+# scripts/security_scan.py lives one directory above app/ — see that file's
+# docstring for what it checks (IDOR via client-supplied user_id, hardcoded
+# secrets, CORS/debug misconfig). Run as a subprocess rather than imported
+# so a crash or hang in the scanner can't take down the API process.
+_SCAN_SCRIPT = Path(__file__).resolve().parent.parent.parent / "scripts" / "security_scan.py"
 
 
 def _check_admin_secret(x_admin_secret: str | None):
@@ -101,3 +112,35 @@ async def grant_access(body: GrantAccessRequest, x_admin_secret: str = Header(No
     }).execute()
 
     return {"updated": result.data}
+
+
+@router.get("/security-scan")
+async def run_security_scan(x_admin_secret: str = Header(None)):
+    """Runs scripts/security_scan.py and returns its findings as JSON —
+    powers the founder-only Security Dashboard page. See that script's
+    docstring for exactly what it checks (IDOR, hardcoded secrets, CORS/
+    debug misconfig) and why (the 2026-06-29 auth-gap review). Static
+    analysis only — no live requests are made against this or any other
+    service, so this is safe to run as often as you like."""
+    _check_admin_secret(x_admin_secret)
+
+    if not _SCAN_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail=f"Scanner not found at {_SCAN_SCRIPT}")
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_SCAN_SCRIPT), "--json"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Security scan timed out")
+
+    if not proc.stdout.strip():
+        raise HTTPException(status_code=500, detail=f"Scanner produced no output: {proc.stderr[-2000:]}")
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail=f"Scanner output was not valid JSON: {proc.stdout[-2000:]}")
+
+    return payload

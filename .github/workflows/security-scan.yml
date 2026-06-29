@@ -1,0 +1,40 @@
+name: Security scan
+
+# Runs scripts/security_scan.py (static analysis only — reads source,
+# makes no live requests) on every push/PR that touches app/ or the
+# scanner itself. Fails the build on any HIGH severity finding (the
+# script's own exit code already encodes this: 1 if HIGH > 0, else 0),
+# so a regression of the 2026-06-29 IDOR pattern (client-supplied
+# user_id with no get_current_user/require_owner check) or a hardcoded
+# secret can't merge silently.
+#
+# See scripts/security_scan.py's module docstring for exactly what it
+# checks and why. Also exposed at runtime via the founder-only
+# GET /admin/security-scan endpoint (app/routers/admin.py) for ad-hoc
+# checks against the live deploy.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'scripts/security_scan.py'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'scripts/security_scan.py'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run security scan
+        run: python3 scripts/security_scan.py
