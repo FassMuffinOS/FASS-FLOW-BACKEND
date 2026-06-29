@@ -30,7 +30,8 @@ Flow:
      per business via the stored stripe_connect_account_id).
 """
 import stripe
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 
@@ -47,7 +48,8 @@ def _get_profile(sb, user_id: str) -> dict:
 
 
 @router.post("/start")
-async def start_connect_onboarding(user_id: str = Query(..., min_length=1)):
+async def start_connect_onboarding(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only set up payouts for your own account")
     if not settings.stripe_secret_key:
         raise HTTPException(status_code=503, detail="Payments are not configured yet")
 
@@ -83,7 +85,8 @@ async def start_connect_onboarding(user_id: str = Query(..., min_length=1)):
 
 
 @router.get("/status")
-async def connect_status(user_id: str = Query(..., min_length=1)):
+async def connect_status(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own payout status")
     sb = get_supabase()
     profile = _get_profile(sb, user_id)
     account_id = profile.get("stripe_connect_account_id")

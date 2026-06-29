@@ -31,9 +31,10 @@ from classroom_rewards' level math and affiliates' rank math — same
 one-row-per-user + append-only-log shape, different curve, because the
 three features measure different things.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 
 router = APIRouter(prefix="/growth-challenge", tags=["growth-challenge"])
@@ -384,7 +385,8 @@ def _run_checks(sb, user_id: str) -> dict:
 # ── Endpoints ────────────────────────────────────────────────────────
 
 @router.get("/mine")
-async def get_my_growth_challenge(user_id: str):
+async def get_my_growth_challenge(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own growth challenge")
     sb = get_supabase()
     state = _get_state(sb, user_id)
     completions = (
@@ -422,12 +424,13 @@ async def get_my_growth_challenge(user_id: str):
 
 
 @router.post("/check")
-async def check_growth_challenge(user_id: str):
+async def check_growth_challenge(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Re-evaluate every auto-detectable mission/achievement against live
     account state. Cheap to call often — it's pure reads plus inserts for
     whatever is newly true, same idempotent shape as business_events."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id is required")
+    require_owner(current_user, user_id, detail="You can only check your own growth challenge")
     sb = get_supabase()
     result = _run_checks(sb, user_id)
     return result
@@ -439,11 +442,12 @@ class CompleteMissionRequest(BaseModel):
 
 
 @router.post("/complete")
-async def complete_mission(body: CompleteMissionRequest):
+async def complete_mission(body: CompleteMissionRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Manual completion for missions with no reliable auto-signal (see
     auto_key: None in MISSIONS). Auto-detectable missions are rejected here
     so the ledger only ever records genuine, verifiable progress — call
     /check instead for those."""
+    require_owner(current_user, body.user_id, detail="You can only complete missions for your own account")
     mission = MISSIONS_BY_KEY.get(body.mission_key)
     if not mission:
         raise HTTPException(status_code=404, detail="Unknown mission")
@@ -471,11 +475,12 @@ class ClaimAchievementRequest(BaseModel):
 
 
 @router.post("/claim-achievement")
-async def claim_achievement(body: ClaimAchievementRequest):
+async def claim_achievement(body: ClaimAchievementRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Manual claim for the two achievements with no ledger to verify
     against yet (First $10,000, First Employee). Honor-system by design —
     same trust model as bd_partner_activity's manual logging elsewhere in
     this codebase."""
+    require_owner(current_user, body.user_id, detail="You can only claim achievements for your own account")
     achievement = ACHIEVEMENTS_BY_KEY.get(body.achievement_key)
     if not achievement:
         raise HTTPException(status_code=404, detail="Unknown achievement")

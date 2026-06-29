@@ -73,6 +73,10 @@ PUBLIC_ALLOWLIST: set[tuple[str, str]] = {
     ("careers.py", "/apply"),                 # public job application form
     ("admin.py", "/invite"),                  # gated by X-Admin-Secret, not session
     ("admin.py", "/grant-access"),            # gated by X-Admin-Secret, not session
+    ("feed.py", "/user/{user_id}"),           # deliberately public per-business feed (Profile.jsx embed)
+    ("rewards.py", "/join"),                   # public loyalty-card claim, no customer account required
+    ("users.py", "/{user_id}/profile"),        # GET only — public display-name read, same as feed.py/chat.py
+    ("profiles.py", "/{user_id}"),              # the discoverable Business Profiles feature — public by design
 }
 
 USER_ID_FIELDS = {"user_id", "business_user_id", "affiliate_user_id", "owner_id"}

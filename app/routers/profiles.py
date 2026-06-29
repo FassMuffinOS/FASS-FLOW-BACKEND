@@ -29,7 +29,12 @@ async def get_profile(user_id: str):
     wallet members, businesses helped). Never 404s on a real auth user —
     a person with none of these set up yet still gets a valid, mostly-empty
     profile rather than an error, since "no stats yet" is the normal state
-    for a brand-new account, not a bug."""
+    for a brand-new account, not a bug.
+
+    Deliberately public, no auth required — this IS the discoverable
+    Business Profiles feature (linked from chat, search, Team Up; see
+    Profile.jsx), the whole point of which is that anyone can look someone
+    up by user_id. See PUBLIC_ALLOWLIST in scripts/security_scan.py."""
     sb = get_supabase()
 
     profile = single_data(

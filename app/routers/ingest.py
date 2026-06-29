@@ -17,9 +17,10 @@ import re
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -93,9 +94,10 @@ class CapturePayload(BaseModel):
 
 
 @router.get("/key")
-async def get_key(user_id: str):
+async def get_key(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
+    require_owner(current_user, user_id, detail="You can only view your own capture key")
     return {"key": _get_or_create_key(user_id)}
 
 

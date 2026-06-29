@@ -15,9 +15,10 @@ the business sent/redeemed counts + a rough revenue estimate.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 from app.services.apns import notify_devices
 
@@ -72,12 +73,13 @@ class CreateCampaignRequest(BaseModel):
 
 
 @router.post("")
-async def create_and_send_campaign(body: CreateCampaignRequest):
+async def create_and_send_campaign(body: CreateCampaignRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Creates the campaign, then immediately broadcasts it onto either every
     customer card this business has issued, or — if target_slugs is set —
     just that selected subset. There's no separate 'draft then send' step in
     the MVP, matching the one-way-broadcast spec (write an offer, it goes
     out, optionally to a chosen segment)."""
+    require_owner(current_user, body.business_user_id, detail="You can only send campaigns for your own account")
     sb = get_supabase()
     row = {
         "business_user_id": body.business_user_id,
@@ -123,7 +125,8 @@ async def create_and_send_campaign(body: CreateCampaignRequest):
 
 
 @router.get("/mine")
-async def list_my_campaigns(user_id: str = Query(..., min_length=1)):
+async def list_my_campaigns(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own campaigns")
     sb = get_supabase()
     campaigns = (
         sb.table("wallet_campaigns")
@@ -194,11 +197,12 @@ class RedeemCampaignRequest(BaseModel):
 
 
 @router.post("/redeem")
-async def redeem_campaign_offer(body: RedeemCampaignRequest):
+async def redeem_campaign_offer(body: RedeemCampaignRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Staff-side confirm step after scanning a customer's existing pass QR
     with their phone's camera — lands on the frontend's redemption confirm
     page, which calls this. Ownership-checked the same way /rewards/stamp
     and /rewards/redeem already are."""
+    require_owner(current_user, body.business_user_id, detail="You can only redeem offers for your own business")
     sb = get_supabase()
     card = single_data(
         sb.table("reward_cards")
@@ -235,11 +239,12 @@ async def redeem_campaign_offer(body: RedeemCampaignRequest):
 
 
 @router.get("/lookup")
-async def lookup_card_for_redemption(slug: str = Query(..., min_length=1), business_user_id: str = Query(..., min_length=1)):
+async def lookup_card_for_redemption(slug: str = Query(..., min_length=1), business_user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
     """Backs the staff redemption confirm page — given a slug (read off the
     customer's pass QR, which already encodes a flow.fass.systems URL) and
     the logged-in business's own user id, returns enough info to render a
     'Confirm Redeem' screen before /campaigns/redeem is actually called."""
+    require_owner(current_user, business_user_id, detail="You can only look up your own business's cards")
     sb = get_supabase()
     card = single_data(
         sb.table("reward_cards")

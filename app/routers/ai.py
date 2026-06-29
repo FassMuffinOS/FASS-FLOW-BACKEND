@@ -21,9 +21,10 @@ regex value as the source of truth even when the LLM also extracts them —
 the LLM's extraction of those fields is only used as a fallback, and is
 tagged as such, because a hallucinated date is worse than no date.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.services.llm import llm_router, extract_json, LLMUnavailableError
 from app.services.retrieval import rank_passages
 from app.services.quota import check_and_consume_ai_quota
@@ -266,9 +267,11 @@ class ReadSynthesisRequest(BaseModel):
 
 
 @router.post("/read-synthesis")
-async def read_synthesis(body: ReadSynthesisRequest):
+async def read_synthesis(body: ReadSynthesisRequest, current_user: CurrentUser = Depends(get_current_user)):
     if not body.solicitation_text.strip():
         raise HTTPException(status_code=400, detail="solicitation_text is required")
+    if body.user_id:
+        require_owner(current_user, body.user_id, detail="You can only use your own account's AI quota")
     check_and_consume_ai_quota(body.user_id)
 
     categories_block = "\n".join(f"- {cid}: {desc}" for cid, desc in READ_CATEGORIES.items())
@@ -384,9 +387,11 @@ a bid price. Respond with ONLY the JSON object."""
 
 
 @router.post("/cost-breakdown")
-async def cost_breakdown(body: CostBreakdownRequest):
+async def cost_breakdown(body: CostBreakdownRequest, current_user: CurrentUser = Depends(get_current_user)):
     if not body.scope_text.strip():
         raise HTTPException(status_code=400, detail="scope_text is required")
+    if body.user_id:
+        require_owner(current_user, body.user_id, detail="You can only use your own account's AI quota")
     check_and_consume_ai_quota(body.user_id)
 
     award_line = f"Known award ceiling: ${body.award_amount:,.0f}" if body.award_amount else "Known award ceiling: not provided"
@@ -478,9 +483,11 @@ out and why. Respond with ONLY the JSON object."""
 
 
 @router.post("/scope-takeoff")
-async def scope_takeoff(body: ScopeTakeoffRequest):
+async def scope_takeoff(body: ScopeTakeoffRequest, current_user: CurrentUser = Depends(get_current_user)):
     if not body.scope_text.strip():
         raise HTTPException(status_code=400, detail="scope_text is required")
+    if body.user_id:
+        require_owner(current_user, body.user_id, detail="You can only use your own account's AI quota")
     check_and_consume_ai_quota(body.user_id)
 
     naics_line = f"NAICS: {body.naics_code}" if body.naics_code else "NAICS: not provided"
@@ -586,9 +593,11 @@ that aren't in the text. Respond with ONLY the JSON object."""
 
 
 @router.post("/score-opportunity")
-async def score_opportunity(body: ScoreOpportunityRequest):
+async def score_opportunity(body: ScoreOpportunityRequest, current_user: CurrentUser = Depends(get_current_user)):
     if not body.solicitation_text.strip():
         raise HTTPException(status_code=400, detail="solicitation_text is required")
+    if body.user_id:
+        require_owner(current_user, body.user_id, detail="You can only use your own account's AI quota")
     check_and_consume_ai_quota(body.user_id)
 
     pp_lines = [

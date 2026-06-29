@@ -32,10 +32,11 @@ Flow:
 import re
 import uuid
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 from app.services.apns import notify_devices
 from app.services.applewallet import apple_wallet_configured, generate_storecard_pkpass
@@ -59,10 +60,11 @@ class ProgramRequest(BaseModel):
 
 
 @router.post("/program")
-async def upsert_program(body: ProgramRequest):
+async def upsert_program(body: ProgramRequest, current_user: CurrentUser = Depends(get_current_user)):
     """One program per business — upsert keyed on business_user_id so
     re-running this just edits the existing rules instead of creating a
     second, conflicting program."""
+    require_owner(current_user, body.business_user_id, detail="You can only manage your own rewards program")
     sb = get_supabase()
     row = {
         "business_user_id": body.business_user_id,
@@ -77,7 +79,8 @@ async def upsert_program(body: ProgramRequest):
 
 
 @router.get("/program/mine")
-async def get_my_program(user_id: str = Query(..., min_length=1)):
+async def get_my_program(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own rewards program")
     sb = get_supabase()
     program = single_data(
         sb.table("reward_programs")
@@ -108,6 +111,11 @@ class JoinRequest(BaseModel):
 
 @router.post("/join")
 async def join_program(body: JoinRequest):
+    """Deliberately public — this is what a business's QR/link points at so
+    a customer with no FASS Flow account of their own can claim a loyalty
+    card. business_user_id here identifies which business's program to join,
+    not the caller's own account, so there's no "owner" to check against.
+    See PUBLIC_ALLOWLIST in scripts/security_scan.py."""
     sb = get_supabase()
     program = single_data(
         sb.table("reward_programs")
@@ -138,7 +146,8 @@ class StampRequest(BaseModel):
 
 
 @router.post("/stamp")
-async def add_stamp(body: StampRequest):
+async def add_stamp(body: StampRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.business_user_id, detail="You can only stamp cards under your own program")
     sb = get_supabase()
     card = single_data(
         sb.table("reward_cards")
@@ -166,12 +175,13 @@ class RedeemRequest(BaseModel):
 
 
 @router.post("/redeem")
-async def redeem_reward(body: RedeemRequest):
+async def redeem_reward(body: RedeemRequest, current_user: CurrentUser = Depends(get_current_user)):
     """The business confirms they've handed over the free item. Resets the
     card by subtracting the threshold (not zeroing outright) so any stamps
     earned past the threshold carry forward into the next round instead of
     being thrown away, bumps redeemed_count for the business's own loyalty
     insight, and logs an audit row in reward_redemptions."""
+    require_owner(current_user, body.business_user_id, detail="You can only redeem cards under your own program")
     sb = get_supabase()
     card = single_data(
         sb.table("reward_cards")

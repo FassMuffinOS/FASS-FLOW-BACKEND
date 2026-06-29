@@ -2,8 +2,9 @@
 from datetime import datetime, timezone
 
 import stripe
-from fastapi import APIRouter, HTTPException, Request, Header
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from pydantic import BaseModel
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase
 from app.routers.affiliates import record_conversion
@@ -41,7 +42,8 @@ class CheckoutRequest(BaseModel):
 
 
 @router.post("/checkout")
-async def create_checkout_session(body: CheckoutRequest):
+async def create_checkout_session(body: CheckoutRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only start checkout for your own account")
     price_id = PLAN_PRICE_MAP.get(body.plan)
     if not price_id:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
@@ -200,7 +202,8 @@ async def stripe_webhook(
 
 
 @router.get("/portal/{user_id}")
-async def customer_portal(user_id: str):
+async def customer_portal(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only manage your own billing")
     sb = get_supabase()
     result = sb.table("profiles").select("stripe_customer_id").eq("id", user_id).single().execute()
     customer_id = result.data["stripe_customer_id"]

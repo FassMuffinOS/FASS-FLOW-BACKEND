@@ -11,9 +11,10 @@ Like Team Up's partner_posts, this uses the service-role client for every
 read/write rather than letting clients query business_posts directly, since
 the feed fans out across every user's rows.
 """
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 
@@ -101,12 +102,13 @@ class CreatePostRequest(BaseModel):
 
 
 @router.post("/posts")
-async def create_post(req: CreatePostRequest):
+async def create_post(req: CreatePostRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Used both by the Feed composer (source='manual') and by server-side
     milestone hooks (source='auto', e.g. Pipeline.jsx calling this right
-    after marking a record 'awarded'). Trusts user_id from the request body
-    the same way every other router here does — no separate auth dependency
-    exists yet in this codebase (see partners.py's docstring)."""
+    after marking a record 'awarded'). 2026-06-29 fix: now requires the
+    caller to be logged in as req.user_id — previously trusted it from the
+    body with no check at all."""
+    require_owner(current_user, req.user_id, detail="You can only post as yourself")
     if not req.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     if req.source not in ("manual", "auto"):
@@ -193,7 +195,8 @@ async def seed_feed(x_admin_secret: str | None = Header(None)):
 
 
 @router.delete("/posts/{post_id}")
-async def delete_post(post_id: str, user_id: str):
+async def delete_post(post_id: str, user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only delete your own posts")
     sb = get_supabase()
     post = single_data(sb.table("business_posts").select("user_id").eq("id", post_id).maybe_single().execute())
     if not post:
@@ -209,9 +212,10 @@ class LikeRequest(BaseModel):
 
 
 @router.post("/posts/{post_id}/like")
-async def toggle_like(post_id: str, req: LikeRequest):
+async def toggle_like(post_id: str, req: LikeRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Toggle, not set — matches the heart-button UX (tap to like, tap again
     to unlike) rather than separate like/unlike endpoints."""
+    require_owner(current_user, req.user_id, detail="You can only like posts as yourself")
     sb = get_supabase()
     existing = (
         sb.table("business_post_likes")
@@ -249,7 +253,8 @@ class CreateCommentRequest(BaseModel):
 
 
 @router.post("/posts/{post_id}/comments")
-async def create_comment(post_id: str, req: CreateCommentRequest):
+async def create_comment(post_id: str, req: CreateCommentRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, req.user_id, detail="You can only comment as yourself")
     if not req.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     sb = get_supabase()

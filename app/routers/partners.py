@@ -14,9 +14,10 @@ enforces user_id == the authenticated caller at the application layer the
 same way every other router here does (no separate auth dependency exists
 yet in this codebase), so a client can't post as someone else.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 
 router = APIRouter(prefix="/partners", tags=["partners"])
@@ -32,7 +33,8 @@ class CreatePostRequest(BaseModel):
 
 
 @router.post("/posts")
-async def create_post(body: CreatePostRequest):
+async def create_post(body: CreatePostRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only post as yourself")
     if not body.title.strip() or not body.what_i_bring.strip() or not body.what_i_need.strip():
         raise HTTPException(status_code=400, detail="title, what_i_bring, and what_i_need are required")
 
@@ -68,7 +70,8 @@ async def list_posts(status: str = "open", limit: int = 50):
 
 
 @router.get("/posts/mine")
-async def my_posts(user_id: str):
+async def my_posts(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own posts")
     sb = get_supabase()
     rows = (
         sb.table("partner_posts")
@@ -87,7 +90,8 @@ class ClosePostRequest(BaseModel):
 
 
 @router.post("/posts/{post_id}/close")
-async def close_post(post_id: str, body: ClosePostRequest):
+async def close_post(post_id: str, body: ClosePostRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only close your own posts")
     sb = get_supabase()
     post = single_data(sb.table("partner_posts").select("user_id").eq("id", post_id).maybe_single().execute())
     if not post:

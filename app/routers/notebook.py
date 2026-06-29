@@ -24,9 +24,10 @@ Three jobs, mirroring migrations/classroom_notebook.sql:
 """
 from datetime import date, timedelta
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 from app.services.llm import llm_router, extract_json, LLMUnavailableError
 from app.services.retrieval import rank_passages
@@ -61,7 +62,8 @@ def _level_for(xp: int) -> int:
 
 
 @router.post("/complete-night")
-async def complete_night(body: CompleteNightRequest):
+async def complete_night(body: CompleteNightRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only complete nights for your own account")
     sb = get_supabase()
     row = single_data(
         sb.table("classroom_rewards").select("*").eq("user_id", body.user_id).maybe_single().execute()
@@ -107,7 +109,8 @@ async def complete_night(body: CompleteNightRequest):
 
 
 @router.get("/rewards/mine")
-async def get_my_rewards(user_id: str):
+async def get_my_rewards(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own rewards")
     sb = get_supabase()
     row = single_data(
         sb.table("classroom_rewards").select("*").eq("user_id", user_id).maybe_single().execute()
@@ -147,7 +150,8 @@ say so and suggest what night or tool in FASS Flow would actually answer it, rat
 
 
 @router.post("/chat")
-async def chat(body: ChatRequest):
+async def chat(body: ChatRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only chat in your own notebook")
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
     check_and_consume_ai_quota(body.user_id)
@@ -237,7 +241,8 @@ the insight and leave niche_keywords empty. Respond with ONLY the JSON object.""
 
 
 @router.post("/insight")
-async def generate_insight(body: InsightRequest):
+async def generate_insight(body: InsightRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only generate insight for your own account")
     check_and_consume_ai_quota(body.user_id)
     sb = get_supabase()
     profile = single_data(
@@ -315,7 +320,8 @@ headers, no markdown."""
 
 
 @router.post("/daily-brief")
-async def daily_brief(body: DailyBriefRequest):
+async def daily_brief(body: DailyBriefRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only request your own daily brief")
     check_and_consume_ai_quota(body.user_id)
     sb = get_supabase()
     profile = single_data(
@@ -375,7 +381,8 @@ markdown, no bullet points."""
 
 
 @router.post("/ask")
-async def ask_chief_of_staff(body: ChiefOfStaffRequest):
+async def ask_chief_of_staff(body: ChiefOfStaffRequest, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, body.user_id, detail="You can only ask about your own account")
     if not body.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
     check_and_consume_ai_quota(body.user_id)
@@ -411,7 +418,8 @@ Owner's question: {body.question.strip()}"""
 # ── My Notebook page ─────────────────────────────────────────────────
 
 @router.get("/mine")
-async def get_my_notebook(user_id: str):
+async def get_my_notebook(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own notebook")
     sb = get_supabase()
     entries = (
         sb.table("classroom_notebook")

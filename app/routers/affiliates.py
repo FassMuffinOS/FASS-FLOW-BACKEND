@@ -25,9 +25,10 @@ import re
 import string
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 
@@ -216,12 +217,13 @@ class JoinRequest(BaseModel):
 
 
 @router.post("/join")
-async def join(body: JoinRequest):
+async def join(body: JoinRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Self-serve — any signed-in user can become an affiliate. No admin
     gate here on purpose: this is the growth lever, the fewer steps between
     "I want to promote this" and "here's your link" the better. Abuse (fake
     signups, self-referral) is caught at payout time, not signup time —
     the admin console shows every conversion before any money moves."""
+    require_owner(current_user, body.user_id, detail="You can only set up your own affiliate account")
     sb = get_supabase()
     existing = single_data(
         sb.table("affiliates").select("*").eq("user_id", body.user_id).maybe_single().execute()
@@ -266,7 +268,8 @@ async def join(body: JoinRequest):
 
 
 @router.get("/me")
-async def get_me(user_id: str):
+async def get_me(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    require_owner(current_user, user_id, detail="You can only view your own affiliate dashboard")
     sb = get_supabase()
     affiliate = single_data(
         sb.table("affiliates").select("*").eq("user_id", user_id).maybe_single().execute()
@@ -360,10 +363,11 @@ CLAIMABLE_ACTIONS = {"complete_profile", "watch_onboarding"}
 
 
 @router.post("/xp/claim")
-async def claim_xp(body: XpClaimRequest):
+async def claim_xp(body: XpClaimRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Manual, self-reported Day-1 onboarding mission items — there's no
     backend signal for "read your profile" or "watched the video", so the
     person just checks it off. Idempotent either way, can't be farmed."""
+    require_owner(current_user, body.user_id, detail="You can only claim your own XP")
     if body.action not in CLAIMABLE_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {sorted(CLAIMABLE_ACTIONS)}")
     sb = get_supabase()
@@ -381,10 +385,11 @@ class AssignmentDoneRequest(BaseModel):
 
 
 @router.post("/assignment/done")
-async def mark_assignment_done(body: AssignmentDoneRequest):
+async def mark_assignment_done(body: AssignmentDoneRequest, current_user: CurrentUser = Depends(get_current_user)):
     """Today's directive action item — +25 XP, once per calendar day
     (UTC), tracked via affiliate_xp_events so it survives across devices
     instead of living only in localStorage."""
+    require_owner(current_user, body.user_id, detail="You can only mark your own assignment done")
     sb = get_supabase()
     affiliate = single_data(
         sb.table("affiliates").select("user_id").eq("user_id", body.user_id).maybe_single().execute()
@@ -424,10 +429,11 @@ class AttributeRequest(BaseModel):
 
 
 @router.post("/attribute")
-async def attribute(body: AttributeRequest):
+async def attribute(body: AttributeRequest, current_user: CurrentUser = Depends(get_current_user)):
     """First click wins — only ever sets referred_by_code if it isn't
     already set, so a user clicking a second creator's link later doesn't
     steal credit from whoever actually brought them in."""
+    require_owner(current_user, body.user_id, detail="You can only attribute your own account")
     sb = get_supabase()
     affiliate = single_data(
         sb.table("affiliates").select("user_id").eq("code", body.code).maybe_single().execute()
