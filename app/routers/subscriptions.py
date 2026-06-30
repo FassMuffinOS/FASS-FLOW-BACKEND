@@ -21,11 +21,26 @@ PLAN_PRICE_MAP = {
     "team":       settings.stripe_price_team,
     "enterprise": settings.stripe_price_enterprise,
 }
+# Annual variants — same plans, same Stripe products, 17% off vs. 12x the
+# monthly price. 'lite' has no annual option (not offered on the pricing
+# page at all). See EXPECTED_PRICE_CENTS / ANNUAL_EXPECTED_PRICE_CENTS below
+# for the exact dollar amounts each of these is asserted to charge.
+ANNUAL_PLAN_PRICE_MAP = {
+    "starter":    settings.stripe_price_starter_annual,
+    "pro":        settings.stripe_price_pro_annual,
+    "team":       settings.stripe_price_team_annual,
+    "enterprise": settings.stripe_price_enterprise_annual,
+}
 # Reverse lookup so subscription.created/updated events — which carry a
 # Stripe price ID on the subscription item, not our plan name — can be
 # mapped back to the plan tier without re-deriving it from checkout
 # session metadata (which isn't present on these event types at all).
-PRICE_TO_PLAN_MAP = {v: k for k, v in PLAN_PRICE_MAP.items() if v}
+# Merges monthly + annual so an annual subscriber's plan resolves correctly
+# too — whichever interval they picked at checkout.
+PRICE_TO_PLAN_MAP = {
+    **{v: k for k, v in PLAN_PRICE_MAP.items() if v},
+    **{v: k for k, v in ANNUAL_PLAN_PRICE_MAP.items() if v},
+}
 
 
 def _plan_from_subscription(sub) -> str | None:
@@ -41,21 +56,27 @@ class CheckoutRequest(BaseModel):
     plan: str          # "lite" | "starter" | "pro" | "team" | "enterprise"
     user_id: str
     email: str
+    billing_interval: str = "month"  # "month" | "year" — "year" = 17% off
 
 
 @router.post("/checkout")
 async def create_checkout_session(body: CheckoutRequest, current_user: CurrentUser = Depends(get_current_user)):
     require_owner(current_user, body.user_id, detail="You can only start checkout for your own account")
-    price_id = PLAN_PRICE_MAP.get(body.plan)
+    annual = body.billing_interval == "year"
+    price_map = ANNUAL_PLAN_PRICE_MAP if annual else PLAN_PRICE_MAP
+    price_id = price_map.get(body.plan)
     if not price_id:
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown plan/interval: {body.plan}/{body.billing_interval}",
+        )
 
     session = stripe.checkout.Session.create(
         mode="subscription",
         payment_method_types=["card"],
         line_items=[{"price": price_id, "quantity": 1}],
         customer_email=body.email,
-        metadata={"user_id": body.user_id, "plan": body.plan},
+        metadata={"user_id": body.user_id, "plan": body.plan, "billing_interval": body.billing_interval},
         success_url=f"{settings.frontend_url}/dashboard?checkout=success",
         cancel_url=f"{settings.frontend_url}/pricing?checkout=cancelled",
         trial_period_days=14,
@@ -256,32 +277,38 @@ EXPECTED_PRICE_CENTS = {
     "enterprise": 150000, # Enterprise — $1,500/mo
 }
 
+# Annual = monthly * 12 * 0.83 (17% off), rounded to the cent. 'lite' is
+# intentionally absent — no annual option for that tier.
+ANNUAL_EXPECTED_PRICE_CENTS = {
+    "starter": 98604,      # Core — $986.04/yr
+    "pro": 199200,         # Pro — $1,992.00/yr
+    "team": 497004,        # Team — $4,970.04/yr
+    "enterprise": 1494000, # Enterprise — $14,940.00/yr
+}
 
-@router.get("/admin/pricing-check")
-async def pricing_check(x_admin_secret: str = Header(None)):
-    """Pre-launch pricing sweep — run before flipping payments live and any
-    time a price changes. For every plan it confirms the Stripe price env is
-    set, points to a real ACTIVE recurring USD price, charges exactly what the
-    pricing page advertises, and that no two plans share a price id (which
-    would corrupt the webhook's PRICE_TO_PLAN reverse lookup). Read-only.
 
-        curl -s https://<backend>/api/v1/subscriptions/admin/pricing-check \\
-             -H "X-Admin-Secret: $ADMIN_SECRET" | python3 -m json.tool
-    """
-    if not settings.admin_secret or x_admin_secret != settings.admin_secret:
-        raise HTTPException(status_code=401, detail="Invalid admin secret")
-
+def _check_price_map(price_map: dict, expected_cents: dict, expected_interval: str, seen_price_ids: dict) -> list:
+    """Shared sweep logic for both the monthly and annual price maps —
+    confirms each plan's price env is set, points to a real ACTIVE
+    recurring USD price at the expected interval/amount, and that no price
+    id is reused across plans or intervals (which would corrupt the
+    webhook's PRICE_TO_PLAN reverse lookup)."""
     results = []
-    seen_price_ids: dict[str, str] = {}
-    for plan, price_id in PLAN_PRICE_MAP.items():
-        offered = plan in EXPECTED_PRICE_CENTS
-        row = {"plan": plan, "offered": offered, "price_id": price_id or None, "issues": []}
+    for plan, price_id in price_map.items():
+        offered = plan in expected_cents
+        row = {
+            "plan": plan,
+            "interval": expected_interval,
+            "offered": offered,
+            "price_id": price_id or None,
+            "issues": [],
+        }
 
         if not price_id:
             if offered:
                 row["issues"].append("price id env var is blank — checkout/webhook will fail for this plan")
             else:
-                row["issues"].append("price id not set (plan not offered on pricing page — OK)")
+                row["issues"].append("price id not set (plan/interval not offered — OK)")
             row["ok"] = not offered
             results.append(row)
             continue
@@ -291,7 +318,7 @@ async def pricing_check(x_admin_secret: str = Header(None)):
                 f"shares its Stripe price id with '{seen_price_ids[price_id]}' — "
                 "webhook plan mapping will be wrong for one of them"
             )
-        seen_price_ids[price_id] = plan
+        seen_price_ids[price_id] = f"{plan} ({expected_interval})"
 
         try:
             price = stripe.Price.retrieve(price_id)
@@ -305,24 +332,46 @@ async def pricing_check(x_admin_secret: str = Header(None)):
         row["amount_cents"] = price.get("unit_amount")
         row["amount_display"] = f"${(price.get('unit_amount') or 0) / 100:.2f}"
         row["currency"] = price.get("currency")
-        row["interval"] = recurring.get("interval")
+        row["actual_interval"] = recurring.get("interval")
         row["active"] = bool(price.get("active"))
 
         if not price.get("active"):
             row["issues"].append("price is archived/inactive in Stripe")
         if price.get("currency") != "usd":
             row["issues"].append(f"currency is '{price.get('currency')}', expected 'usd'")
-        if recurring.get("interval") != "month":
-            row["issues"].append(f"billing interval is '{recurring.get('interval')}', expected 'month'")
-        expected = EXPECTED_PRICE_CENTS.get(plan)
+        if recurring.get("interval") != expected_interval:
+            row["issues"].append(f"billing interval is '{recurring.get('interval')}', expected '{expected_interval}'")
+        expected = expected_cents.get(plan)
         if expected is not None and price.get("unit_amount") != expected:
             row["issues"].append(
-                f"charges ${ (price.get('unit_amount') or 0) / 100:.2f} but the pricing page "
-                f"advertises ${expected / 100:.2f}"
+                f"charges ${ (price.get('unit_amount') or 0) / 100:.2f} but is expected to charge "
+                f"${expected / 100:.2f}"
             )
 
         row["ok"] = not row["issues"]
         results.append(row)
+    return results
+
+
+@router.get("/admin/pricing-check")
+async def pricing_check(x_admin_secret: str = Header(None)):
+    """Pre-launch pricing sweep — run before flipping payments live and any
+    time a price changes. For every plan + billing interval it confirms the
+    Stripe price env is set, points to a real ACTIVE recurring USD price,
+    charges exactly the expected amount, and that no price id is reused
+    across plans/intervals (which would corrupt the webhook's PRICE_TO_PLAN
+    reverse lookup). Read-only.
+
+        curl -s https://<backend>/api/v1/subscriptions/admin/pricing-check \\
+             -H "X-Admin-Secret: $ADMIN_SECRET" | python3 -m json.tool
+    """
+    if not settings.admin_secret or x_admin_secret != settings.admin_secret:
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
+
+    seen_price_ids: dict[str, str] = {}
+    monthly_results = _check_price_map(PLAN_PRICE_MAP, EXPECTED_PRICE_CENTS, "month", seen_price_ids)
+    annual_results = _check_price_map(ANNUAL_PLAN_PRICE_MAP, ANNUAL_EXPECTED_PRICE_CENTS, "year", seen_price_ids)
+    results = monthly_results + annual_results
 
     offered_ok = all(r["ok"] for r in results if r["offered"])
     return {
