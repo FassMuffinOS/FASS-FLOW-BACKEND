@@ -138,6 +138,7 @@ class DraftSectionRequest(BaseModel):
     core_competencies: str = ""
     differentiators: str = ""
     past_performance: list[PastPerformanceItem] = []
+    user_id: str | None = None  # when present, the draft costs 1 AI credit
 
 
 DRAFT_SYSTEM_PROMPT = """You are a proposal writer for a small government contractor. Draft a \
@@ -151,6 +152,15 @@ with generic claims. Write in a confident, plain, specific register — no buzzw
 
 @router.post("/draft-section")
 async def draft_section(body: DraftSectionRequest):
+    # Meter against AI credits when a user is identified. 402 = out of credits,
+    # so the client can prompt a refill instead of silently failing.
+    remaining_credits = None
+    if body.user_id:
+        from app.routers.credits import consume_credits
+        ok, remaining_credits = consume_credits(body.user_id, 1, reason="proposal_draft")
+        if not ok:
+            raise HTTPException(status_code=402, detail="Out of AI credits — refill to keep drafting.")
+
     passages = [
         f"{pp.contract} — {pp.client}. {pp.description} ({pp.period}, {pp.value})".strip()
         for pp in body.past_performance
@@ -182,6 +192,7 @@ Most relevant past performance on file (use only these, do not invent others):
         "provider": result.provider,
         "model": result.model,
         "grounded_in": [{"text": g["text"], "score": round(g["score"], 3)} for g in grounded],
+        "remaining_credits": remaining_credits,
     }
 
 
