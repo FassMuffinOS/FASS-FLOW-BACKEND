@@ -130,15 +130,15 @@ async def stripe_webhook(
                 "subscription_status": "active",
             }).execute()
 
-            # First invoice only — recurring renewals come through as
-            # invoice.payment_succeeded below, which would double-count if
-            # this also fired commission on every renewal cycle silently.
-            # That's a deliberate choice for now (commission on signup
-            # value, not lifetime recurring revenue share) — revisit if the
-            # program needs to pay out on renewals too.
-            amount = (session.get("amount_total") or 0) / 100
-            if amount > 0:
-                record_conversion(user_id, "subscription", amount)
+            # No commission fired here on purpose — Stripe always creates a
+            # real invoice for the first subscription cycle too, which will
+            # land as invoice.payment_succeeded below moments after this
+            # event. Commissioning HERE as well as there would double-pay
+            # the first month. invoice.payment_succeeded is the single
+            # source of truth for subscription commission — first invoice
+            # and every renewal alike — which is what makes "recurring for
+            # 12 months" (gated by record_conversion()'s commission-window
+            # check against profiles.referred_at) actually work.
 
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
@@ -198,6 +198,28 @@ async def stripe_webhook(
             .eq("stripe_customer_id", inv["customer"])
             .execute()
         )
+
+        # Subscription commission lives here, and only here — see the long
+        # comment up in checkout.session.completed for why. Fires on the
+        # first invoice AND every renewal; record_conversion() itself caps
+        # it to a 12-month window from profiles.referred_at, and the
+        # external_ref=inv["id"] dedupes against Stripe's at-least-once
+        # webhook delivery via affiliate_conversions' partial unique index.
+        # Subscription-mode invoices only — skip one-time invoices (e.g.
+        # any non-subscription invoice item) by requiring a subscription id.
+        if event["type"] == "invoice.payment_succeeded" and inv.get("subscription"):
+            amount = (inv.get("amount_paid") or 0) / 100
+            if amount > 0:
+                profile = (
+                    sb.table("profiles")
+                    .select("id")
+                    .eq("stripe_customer_id", inv["customer"])
+                    .maybe_single()
+                    .execute()
+                )
+                user_id = profile.data["id"] if profile and profile.data else None
+                if user_id:
+                    record_conversion(user_id, "subscription", amount, external_ref=inv["id"])
 
     return {"received": True}
 
