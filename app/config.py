@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     stripe_price_starter: str = ""
     stripe_price_pro: str = ""
     stripe_price_team: str = ""
-    stripe_price_enterprise: str = ""  # WARDOG Intel: incumbent/award-history intelligence, $899/mo
+    stripe_price_enterprise: str = ""  # WARDOG Intel: incumbent/award-history intelligence, $3,500/mo
     stripe_price_wallet: str = ""  # one-time price for a real FASS Wallet .pkpass unlock
 
     # Upstash Redis
