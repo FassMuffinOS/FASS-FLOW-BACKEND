@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     stripe_price_team: str = ""
     stripe_price_enterprise: str = ""  # WARDOG Intel: incumbent/award-history intelligence, $1,500/mo
     stripe_price_wallet: str = ""  # one-time price for a real FASS Wallet .pkpass unlock
+    stripe_product_ai_credits: str = ""  # "FASS Flow — AI Credits" product id; its 8 one-time
+                                          # prices ($5..$1000) ARE the pack catalog, see credits.py
 
     # Upstash Redis
     upstash_redis_rest_url: str

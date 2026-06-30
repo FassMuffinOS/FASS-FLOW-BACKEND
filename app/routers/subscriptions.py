@@ -8,6 +8,7 @@ from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase
 from app.routers.affiliates import record_conversion
+from app.routers.credits import grant_purchased_credits
 
 stripe.api_key = settings.stripe_secret_key
 
@@ -116,6 +117,18 @@ async def stripe_webhook(
                     "original_value": value,
                     "balance": value,
                 }, on_conflict="slug").execute()
+        elif metadata.get("kind") == "ai_credits":
+            # AI credit pack purchase — mode="payment", see credits.py's
+            # /checkout. external_ref=session["id"] makes a redelivered
+            # event a no-op instead of a double-grant (see
+            # grant_purchased_credits' docstring for the dedupe mechanics).
+            credit_user_id = metadata.get("user_id")
+            credits_amount = metadata.get("credits")
+            if credit_user_id and credits_amount:
+                grant_purchased_credits(credit_user_id, int(credits_amount), external_ref=session["id"])
+                amount = (session.get("amount_total") or 0) / 100
+                if amount > 0:
+                    record_conversion(credit_user_id, "other", amount, note="ai_credits", external_ref=session["id"])
         else:
             # Defensive: a subscription checkout.session.completed we didn't
             # initiate (or one missing our metadata) has nothing safe to sync.
