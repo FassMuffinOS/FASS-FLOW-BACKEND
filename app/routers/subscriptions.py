@@ -117,10 +117,16 @@ async def stripe_webhook(
                     "balance": value,
                 }, on_conflict="slug").execute()
         else:
-            user_id = metadata["user_id"]
-            plan = metadata["plan"]
-            customer_id = session["customer"]
-            subscription_id = session["subscription"]
+            # Defensive: a subscription checkout.session.completed we didn't
+            # initiate (or one missing our metadata) has nothing safe to sync.
+            # Bracket access here would KeyError -> 500 -> Stripe retries the
+            # event forever. Ack and move on instead.
+            user_id = metadata.get("user_id")
+            plan = metadata.get("plan")
+            if not user_id or not plan:
+                return {"received": True, "skipped": "subscription checkout missing user_id/plan metadata"}
+            customer_id = session.get("customer")
+            subscription_id = session.get("subscription")
 
             sb.table("profiles").upsert({
                 "id": user_id,
@@ -222,6 +228,97 @@ async def stripe_webhook(
                     record_conversion(user_id, "subscription", amount, external_ref=inv["id"])
 
     return {"received": True}
+
+
+# Mirrors Pricing.jsx's advertised monthly prices (USD). Kept here as an
+# INDEPENDENT assertion so the pre-launch check below can flag any drift
+# between what the pricing page promises and what the Stripe price actually
+# charges. Update both together if a price changes. 'free' has no Stripe
+# price; 'lite' is intentionally absent (no longer offered on the page).
+EXPECTED_PRICE_CENTS = {
+    "starter": 9900,      # Core — $99/mo
+    "pro": 20000,         # Pro — $200/mo
+    "team": 49900,        # Team — $499/mo (sales-assisted, but still needs a
+                          # price id set so portal/manual subscriptions map back)
+    "enterprise": 150000, # Enterprise — $1,500/mo
+}
+
+
+@router.get("/admin/pricing-check")
+async def pricing_check(x_admin_secret: str = Header(None)):
+    """Pre-launch pricing sweep — run before flipping payments live and any
+    time a price changes. For every plan it confirms the Stripe price env is
+    set, points to a real ACTIVE recurring USD price, charges exactly what the
+    pricing page advertises, and that no two plans share a price id (which
+    would corrupt the webhook's PRICE_TO_PLAN reverse lookup). Read-only.
+
+        curl -s https://<backend>/api/v1/subscriptions/admin/pricing-check \\
+             -H "X-Admin-Secret: $ADMIN_SECRET" | python3 -m json.tool
+    """
+    if not settings.admin_secret or x_admin_secret != settings.admin_secret:
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
+
+    results = []
+    seen_price_ids: dict[str, str] = {}
+    for plan, price_id in PLAN_PRICE_MAP.items():
+        offered = plan in EXPECTED_PRICE_CENTS
+        row = {"plan": plan, "offered": offered, "price_id": price_id or None, "issues": []}
+
+        if not price_id:
+            if offered:
+                row["issues"].append("price id env var is blank — checkout/webhook will fail for this plan")
+            else:
+                row["issues"].append("price id not set (plan not offered on pricing page — OK)")
+            row["ok"] = not offered
+            results.append(row)
+            continue
+
+        if price_id in seen_price_ids:
+            row["issues"].append(
+                f"shares its Stripe price id with '{seen_price_ids[price_id]}' — "
+                "webhook plan mapping will be wrong for one of them"
+            )
+        seen_price_ids[price_id] = plan
+
+        try:
+            price = stripe.Price.retrieve(price_id)
+        except Exception as exc:
+            row["issues"].append(f"Stripe could not retrieve this price id: {exc}")
+            row["ok"] = False
+            results.append(row)
+            continue
+
+        recurring = price.get("recurring") or {}
+        row["amount_cents"] = price.get("unit_amount")
+        row["amount_display"] = f"${(price.get('unit_amount') or 0) / 100:.2f}"
+        row["currency"] = price.get("currency")
+        row["interval"] = recurring.get("interval")
+        row["active"] = bool(price.get("active"))
+
+        if not price.get("active"):
+            row["issues"].append("price is archived/inactive in Stripe")
+        if price.get("currency") != "usd":
+            row["issues"].append(f"currency is '{price.get('currency')}', expected 'usd'")
+        if recurring.get("interval") != "month":
+            row["issues"].append(f"billing interval is '{recurring.get('interval')}', expected 'month'")
+        expected = EXPECTED_PRICE_CENTS.get(plan)
+        if expected is not None and price.get("unit_amount") != expected:
+            row["issues"].append(
+                f"charges ${ (price.get('unit_amount') or 0) / 100:.2f} but the pricing page "
+                f"advertises ${expected / 100:.2f}"
+            )
+
+        row["ok"] = not row["issues"]
+        results.append(row)
+
+    offered_ok = all(r["ok"] for r in results if r["offered"])
+    return {
+        "all_offered_plans_ok": offered_ok,
+        "stripe_secret_key_set": bool(settings.stripe_secret_key),
+        "stripe_webhook_secret_set": bool(settings.stripe_webhook_secret),
+        "frontend_url": settings.frontend_url,
+        "plans": results,
+    }
 
 
 @router.get("/portal/{user_id}")
