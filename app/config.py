@@ -30,6 +30,12 @@ class Settings(BaseSettings):
                                           # prices ($5..$1000) ARE the pack catalog, see credits.py
     stripe_price_wardog_intel_report: str = ""  # one-time $39 price — single WARDOG Intel report
                                                  # for non-Enterprise users, see intelligence.py
+    gift_card_platform_fee_pct: float = 5.0  # FASS Flow's cut of each Stripe-Connect-routed gift
+                                              # card purchase, percent — see gift_cards.py. Only
+                                              # applies once a business has finished Connect
+                                              # onboarding; pre-Connect purchases are unaffected
+                                              # (the whole payment already sits in the platform
+                                              # account, nothing to split yet).
 
     # Upstash Redis
     upstash_redis_rest_url: str

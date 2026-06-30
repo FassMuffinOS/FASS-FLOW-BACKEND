@@ -34,9 +34,13 @@ wallet.py's /purchase-status/{slug}.
 
 If the business has completed Stripe Connect onboarding (stripe_connect.py),
 /purchase/checkout routes the payment directly to their own connected
-account via a destination charge instead of FASS Flow's master account —
-no platform fee is taken on this yet. Businesses who haven't onboarded keep
-working exactly as before.
+account via a destination charge instead of FASS Flow's master account,
+and FASS Flow takes settings.gift_card_platform_fee_pct (default 5%) off
+the top via Stripe's application_fee_amount — Stripe splits it
+automatically, the fee stays in the platform account and the rest lands
+with the business. Businesses who haven't onboarded keep working exactly
+as before (full payment in the platform account, no fee since there's
+nothing to split yet).
 """
 import re
 import uuid
@@ -321,10 +325,12 @@ async def create_gift_card_checkout(body: CreateGiftCardCheckoutRequest):
     # If this business has finished Stripe Connect onboarding (see
     # stripe_connect.py), send the payment straight to their own connected
     # account instead of FASS Flow's master account — a "destination
-    # charge." No platform fee is taken here; that's a separate business
-    # decision for later, not something to silently add now. Businesses
-    # who haven't onboarded yet keep working exactly as before, with the
-    # money landing in the platform account until they do.
+    # charge" — and take FASS Flow's cut off the top via
+    # application_fee_amount, which Stripe splits automatically: the fee
+    # stays in the platform account, the remainder lands with the business.
+    # Businesses who haven't onboarded yet keep working exactly as before,
+    # with the full payment landing in the platform account until they do
+    # (nothing to split there yet, so no fee applies on that path).
     profile = single_data(
         sb.table("business_profiles")
         .select("stripe_connect_account_id, connect_payouts_enabled")
@@ -333,8 +339,10 @@ async def create_gift_card_checkout(body: CreateGiftCardCheckoutRequest):
         .execute()
     ) or {}
     if profile.get("connect_payouts_enabled") and profile.get("stripe_connect_account_id"):
+        fee_cents = round(body.value * 100 * (settings.gift_card_platform_fee_pct / 100))
         session_kwargs["payment_intent_data"] = {
             "transfer_data": {"destination": profile["stripe_connect_account_id"]},
+            "application_fee_amount": fee_cents,
         }
 
     session = stripe.checkout.Session.create(**session_kwargs)
