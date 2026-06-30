@@ -42,6 +42,33 @@ PRICE_TO_PLAN_MAP = {
     **{v: k for k, v in ANNUAL_PLAN_PRICE_MAP.items() if v},
 }
 
+# Regulars — a completely separate product line (non-govcon local
+# businesses), so these are independent maps, never merged into
+# PLAN_PRICE_MAP/PRICE_TO_PLAN_MAP above. Imported by regulars.py for
+# checkout; used below to keep profiles.wallet_plan in sync with whatever
+# the customer is actually paying for.
+REGULARS_PLAN_PRICE_MAP = {
+    "starter": settings.stripe_price_regulars_starter,
+    "pro": settings.stripe_price_regulars_pro,
+}
+REGULARS_ANNUAL_PLAN_PRICE_MAP = {
+    "starter": settings.stripe_price_regulars_starter_annual,
+    "pro": settings.stripe_price_regulars_pro_annual,
+}
+REGULARS_PRICE_TO_PLAN_MAP = {
+    **{v: k for k, v in REGULARS_PLAN_PRICE_MAP.items() if v},
+    **{v: k for k, v in REGULARS_ANNUAL_PLAN_PRICE_MAP.items() if v},
+}
+
+
+def _regulars_plan_from_subscription(sub) -> str | None:
+    items = (sub.get("items") or {}).get("data") or []
+    for item in items:
+        price_id = (item.get("price") or {}).get("id")
+        if price_id in REGULARS_PRICE_TO_PLAN_MAP:
+            return REGULARS_PRICE_TO_PLAN_MAP[price_id]
+    return None
+
 
 def _plan_from_subscription(sub) -> str | None:
     items = (sub.get("items") or {}).get("data") or []
@@ -156,6 +183,27 @@ async def stripe_webhook(
                 amount = (session.get("amount_total") or 0) / 100
                 if amount > 0:
                     record_conversion(intel_user_id, "other", amount, note="wardog_intel_report", external_ref=session["id"])
+        elif metadata.get("kind") == "regulars_subscription":
+            # Regulars — standalone Wallet/loyalty subscription, see
+            # regulars.py's /signup. Deliberately writes wallet_* columns
+            # only, never profiles.plan/stripe_customer_id/
+            # stripe_subscription_id — those are the GovCon subscription's
+            # fields, and a business could plausibly hold both products on
+            # one login someday.
+            wallet_user_id = metadata.get("user_id")
+            wallet_plan = metadata.get("plan")
+            if wallet_user_id and wallet_plan:
+                sb.table("profiles").update({
+                    "is_wallet_only": True,
+                    "wallet_plan": wallet_plan,
+                    "wallet_billing_interval": metadata.get("billing_interval"),
+                    "wallet_stripe_customer_id": session.get("customer"),
+                    "wallet_stripe_subscription_id": session.get("subscription"),
+                    "wallet_subscription_status": "active",
+                }).eq("id", wallet_user_id).execute()
+            # No commission fired here — same reasoning as the GovCon
+            # subscription branch below: invoice.payment_succeeded is the
+            # single source of truth, first cycle and every renewal alike.
         elif metadata.get("kind") == "ai_credits":
             # AI credit pack purchase — mode="payment", see credits.py's
             # /checkout. external_ref=session["id"] makes a redelivered
@@ -200,10 +248,19 @@ async def stripe_webhook(
 
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
+        # Two independent updates, GovCon columns vs. Regulars columns — a
+        # subscription id only ever matches one or the other, so whichever
+        # doesn't apply here just matches zero rows.
         (
             sb.table("profiles")
             .update({"subscription_status": "cancelled", "plan": "free"})
             .eq("stripe_subscription_id", sub["id"])
+            .execute()
+        )
+        (
+            sb.table("profiles")
+            .update({"wallet_subscription_status": "cancelled"})
+            .eq("wallet_stripe_subscription_id", sub["id"])
             .execute()
         )
 
@@ -221,6 +278,17 @@ async def stripe_webhook(
             sb.table("profiles")
             .update(update)
             .eq("stripe_subscription_id", sub["id"])
+            .execute()
+        )
+
+        wallet_update = {"wallet_subscription_status": sub.get("status", "active")}
+        wallet_plan = _regulars_plan_from_subscription(sub)
+        if wallet_plan:
+            wallet_update["wallet_plan"] = wallet_plan
+        (
+            sb.table("profiles")
+            .update(wallet_update)
+            .eq("wallet_stripe_subscription_id", sub["id"])
             .execute()
         )
 
@@ -256,6 +324,12 @@ async def stripe_webhook(
             .eq("stripe_customer_id", inv["customer"])
             .execute()
         )
+        (
+            sb.table("profiles")
+            .update({"wallet_subscription_status": status})
+            .eq("wallet_stripe_customer_id", inv["customer"])
+            .execute()
+        )
 
         # Subscription commission lives here, and only here — see the long
         # comment up in checkout.session.completed for why. Fires on the
@@ -265,6 +339,9 @@ async def stripe_webhook(
         # webhook delivery via affiliate_conversions' partial unique index.
         # Subscription-mode invoices only — skip one-time invoices (e.g.
         # any non-subscription invoice item) by requiring a subscription id.
+        # Checks BOTH the GovCon and Regulars customer-id columns — a
+        # Regulars subscriber commissions their referring affiliate exactly
+        # the same way a GovCon subscriber does.
         if event["type"] == "invoice.payment_succeeded" and inv.get("subscription"):
             amount = (inv.get("amount_paid") or 0) / 100
             if amount > 0:
@@ -276,6 +353,15 @@ async def stripe_webhook(
                     .execute()
                 )
                 user_id = profile.data["id"] if profile and profile.data else None
+                if not user_id:
+                    wallet_profile = (
+                        sb.table("profiles")
+                        .select("id")
+                        .eq("wallet_stripe_customer_id", inv["customer"])
+                        .maybe_single()
+                        .execute()
+                    )
+                    user_id = wallet_profile.data["id"] if wallet_profile and wallet_profile.data else None
                 if user_id:
                     record_conversion(user_id, "subscription", amount, external_ref=inv["id"])
 
@@ -426,15 +512,30 @@ async def pricing_check(x_admin_secret: str = Header(None)):
     annual_results = _check_price_map(ANNUAL_PLAN_PRICE_MAP, ANNUAL_EXPECTED_PRICE_CENTS, "year", seen_price_ids)
     results = monthly_results + annual_results
 
+    # Regulars — separate product line, but shares the same seen_price_ids
+    # dict so an accidental price-id collision with a GovCon plan still gets
+    # flagged (it's keyed by the actual Stripe price id, not the plan name,
+    # so "starter" existing in both maps is not itself a collision).
+    REGULARS_EXPECTED_CENTS = {"starter": 3900, "pro": 8900}
+    REGULARS_ANNUAL_EXPECTED_CENTS = {"starter": 38844, "pro": 88644}
+    regulars_monthly = _check_price_map(REGULARS_PLAN_PRICE_MAP, REGULARS_EXPECTED_CENTS, "month", seen_price_ids)
+    regulars_annual = _check_price_map(REGULARS_ANNUAL_PLAN_PRICE_MAP, REGULARS_ANNUAL_EXPECTED_CENTS, "year", seen_price_ids)
+    regulars_results = regulars_monthly + regulars_annual
+
     wardog_report = _check_one_time_price(
         "wardog_intel_report", settings.stripe_price_wardog_intel_report, 3900
     )
 
-    offered_ok = all(r["ok"] for r in results if r["offered"]) and wardog_report["ok"]
+    offered_ok = (
+        all(r["ok"] for r in results if r["offered"])
+        and all(r["ok"] for r in regulars_results if r["offered"])
+        and wardog_report["ok"]
+    )
     return {
         "all_offered_plans_ok": offered_ok,
         "stripe_secret_key_set": bool(settings.stripe_secret_key),
         "stripe_webhook_secret_set": bool(settings.stripe_webhook_secret),
+        "regulars_plans": regulars_results,
         "one_time_products": [wardog_report],
         "frontend_url": settings.frontend_url,
         "plans": results,

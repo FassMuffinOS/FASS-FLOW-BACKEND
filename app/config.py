@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     stripe_price_pro_annual: str = ""
     stripe_price_team_annual: str = ""
     stripe_price_enterprise_annual: str = ""
+
+    # Regulars — standalone Wallet/loyalty product for non-govcon local
+    # businesses, completely separate Stripe products from the GovCon plans
+    # above. See regulars.py and subscriptions.py's REGULARS_*_PRICE_MAP.
+    stripe_price_regulars_starter: str = ""
+    stripe_price_regulars_starter_annual: str = ""
+    stripe_price_regulars_pro: str = ""
+    stripe_price_regulars_pro_annual: str = ""
     stripe_product_ai_credits: str = ""  # "FASS Flow — AI Credits" product id; its 8 one-time
                                           # prices ($5..$1000) ARE the pack catalog, see credits.py
     stripe_price_wardog_intel_report: str = ""  # one-time $39 price — single WARDOG Intel report
