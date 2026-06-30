@@ -62,6 +62,50 @@ async def ensure_doc(req: EnsureDocRequest, current_user: CurrentUser = Depends(
     return single_data(sb.table("proposal_documents").insert(row).execute())
 
 
+@router.get("/mine")
+async def my_documents(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """The user's saved proposal drafts — backs the editor's solicitation
+    switcher. Lightweight (no content blob)."""
+    require_owner(current_user, user_id, detail="Not your documents")
+    sb = get_supabase()
+    rows = (
+        sb.table("proposal_documents")
+        .select("id, proposal_id, title, updated_at")
+        .eq("user_id", user_id)
+        .order("updated_at", desc=True)
+        .execute().data or []
+    )
+    return {"documents": rows}
+
+
+class SaveContentRequest(BaseModel):
+    user_id: str
+    content: dict | None = None
+    title: str | None = None
+    format: dict | None = None
+
+
+@router.put("/{document_id}/content")
+async def save_content(document_id: str, req: SaveContentRequest,
+                        current_user: CurrentUser = Depends(get_current_user)):
+    """Save the full draft body (editor JSON) + title/format so it persists
+    across sessions and solicitation switches."""
+    require_owner(current_user, req.user_id, detail="Not your document")
+    sb = get_supabase()
+    _owned_doc(sb, document_id, req.user_id)
+    patch = {}
+    if req.content is not None:
+        patch["content"] = req.content
+    if req.title is not None:
+        patch["title"] = req.title.strip()[:200]
+    if req.format is not None:
+        patch["format"] = req.format
+    if not patch:
+        raise HTTPException(status_code=400, detail="Nothing to save")
+    sb.table("proposal_documents").update(patch).eq("id", document_id).execute()
+    return {"status": "saved"}
+
+
 @router.get("/{document_id}/comments")
 async def list_comments(document_id: str, user_id: str,
                          current_user: CurrentUser = Depends(get_current_user)):
