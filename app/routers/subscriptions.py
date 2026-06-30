@@ -14,10 +14,11 @@ stripe.api_key = settings.stripe_secret_key
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
 PLAN_PRICE_MAP = {
-    "lite":    settings.stripe_price_lite,
-    "starter": settings.stripe_price_starter,
-    "pro":     settings.stripe_price_pro,
-    "team":    settings.stripe_price_team,
+    "lite":       settings.stripe_price_lite,
+    "starter":    settings.stripe_price_starter,
+    "pro":        settings.stripe_price_pro,
+    "team":       settings.stripe_price_team,
+    "enterprise": settings.stripe_price_enterprise,
 }
 # Reverse lookup so subscription.created/updated events — which carry a
 # Stripe price ID on the subscription item, not our plan name — can be
@@ -36,7 +37,7 @@ def _plan_from_subscription(sub) -> str | None:
 
 
 class CheckoutRequest(BaseModel):
-    plan: str          # "lite" | "starter" | "pro" | "team"
+    plan: str          # "lite" | "starter" | "pro" | "team" | "enterprise"
     user_id: str
     email: str
 
