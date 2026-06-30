@@ -138,6 +138,24 @@ async def stripe_webhook(
                     "original_value": value,
                     "balance": value,
                 }, on_conflict="slug").execute()
+        elif metadata.get("kind") == "wardog_intel_report":
+            # à la carte WARDOG Intel report — mode="payment", see
+            # intelligence.py's /checkout. The report row already exists
+            # (created 'pending_payment' before checkout so its id could
+            # ride in metadata); flipping it to 'unused' only if it's still
+            # 'pending_payment' makes this naturally idempotent against
+            # Stripe's at-least-once webhook redelivery — a second delivery
+            # just matches zero rows instead of re-crediting anything.
+            report_id = metadata.get("report_id")
+            intel_user_id = metadata.get("user_id")
+            if report_id:
+                sb.table("wardog_intel_reports").update({"status": "unused"}).eq(
+                    "id", report_id
+                ).eq("status", "pending_payment").execute()
+            if intel_user_id:
+                amount = (session.get("amount_total") or 0) / 100
+                if amount > 0:
+                    record_conversion(intel_user_id, "other", amount, note="wardog_intel_report", external_ref=session["id"])
         elif metadata.get("kind") == "ai_credits":
             # AI credit pack purchase — mode="payment", see credits.py's
             # /checkout. external_ref=session["id"] makes a redelivered
@@ -353,6 +371,41 @@ def _check_price_map(price_map: dict, expected_cents: dict, expected_interval: s
     return results
 
 
+def _check_one_time_price(name: str, price_id: str, expected_cents: int) -> dict:
+    """Same idea as _check_price_map but for a one-time (non-recurring)
+    price — used for the WARDOG Intel à la carte report. Kept separate
+    since 'recurring' is None on one-time prices, so the subscription
+    sweep's interval check doesn't apply here."""
+    row = {"product": name, "price_id": price_id or None, "issues": []}
+    if not price_id:
+        row["issues"].append("price id env var is blank — checkout will fail for this product")
+        row["ok"] = False
+        return row
+    try:
+        price = stripe.Price.retrieve(price_id)
+    except Exception as exc:
+        row["issues"].append(f"Stripe could not retrieve this price id: {exc}")
+        row["ok"] = False
+        return row
+    row["amount_cents"] = price.get("unit_amount")
+    row["amount_display"] = f"${(price.get('unit_amount') or 0) / 100:.2f}"
+    row["currency"] = price.get("currency")
+    row["active"] = bool(price.get("active"))
+    if not price.get("active"):
+        row["issues"].append("price is archived/inactive in Stripe")
+    if price.get("currency") != "usd":
+        row["issues"].append(f"currency is '{price.get('currency')}', expected 'usd'")
+    if price.get("recurring"):
+        row["issues"].append("price is recurring, expected one-time")
+    if price.get("unit_amount") != expected_cents:
+        row["issues"].append(
+            f"charges ${ (price.get('unit_amount') or 0) / 100:.2f} but is expected to charge "
+            f"${expected_cents / 100:.2f}"
+        )
+    row["ok"] = not row["issues"]
+    return row
+
+
 @router.get("/admin/pricing-check")
 async def pricing_check(x_admin_secret: str = Header(None)):
     """Pre-launch pricing sweep — run before flipping payments live and any
@@ -373,11 +426,16 @@ async def pricing_check(x_admin_secret: str = Header(None)):
     annual_results = _check_price_map(ANNUAL_PLAN_PRICE_MAP, ANNUAL_EXPECTED_PRICE_CENTS, "year", seen_price_ids)
     results = monthly_results + annual_results
 
-    offered_ok = all(r["ok"] for r in results if r["offered"])
+    wardog_report = _check_one_time_price(
+        "wardog_intel_report", settings.stripe_price_wardog_intel_report, 3900
+    )
+
+    offered_ok = all(r["ok"] for r in results if r["offered"]) and wardog_report["ok"]
     return {
         "all_offered_plans_ok": offered_ok,
         "stripe_secret_key_set": bool(settings.stripe_secret_key),
         "stripe_webhook_secret_set": bool(settings.stripe_webhook_secret),
+        "one_time_products": [wardog_report],
         "frontend_url": settings.frontend_url,
         "plans": results,
     }

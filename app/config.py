@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     stripe_price_enterprise_annual: str = ""
     stripe_product_ai_credits: str = ""  # "FASS Flow — AI Credits" product id; its 8 one-time
                                           # prices ($5..$1000) ARE the pack catalog, see credits.py
+    stripe_price_wardog_intel_report: str = ""  # one-time $39 price — single WARDOG Intel report
+                                                 # for non-Enterprise users, see intelligence.py
 
     # Upstash Redis
     upstash_redis_rest_url: str

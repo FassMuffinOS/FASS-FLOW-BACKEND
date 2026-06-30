@@ -16,40 +16,66 @@ cached for an hour (award history doesn't move minute to minute the way
 SAM.gov postings do). No nightly ingestion table yet — that's the 0-30
 day roadmap item once this is validated with real Enterprise customers.
 """
+from datetime import datetime, timezone
+
+import stripe
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.cache import cache_get, cache_set
+from app.config import settings
 from app.database import get_supabase, single_data
 from app.routers.credits import consume_credits
 from app.services.llm import llm_router, LLMUnavailableError
+
+stripe.api_key = settings.stripe_secret_key
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
 
 USASPENDING_AWARDS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 
-# Plans that unlock WARDOG Intel. Kept as a set (not a single "==
+# Plans that unlock unlimited WARDOG Intel. Kept as a set (not a single "==
 # enterprise" check) so a future higher tier can inherit access without
-# touching this file.
+# touching this file. Everyone else can still get in à la carte — see
+# wardog_intel_reports below — $39 buys exactly one report (one incumbent
+# pull + one forecast, scoped to a single naics/agency pair).
 INTEL_PLANS = {"enterprise"}
 
 
-def _require_intel_plan(user_id: str) -> None:
-    """Server-side gate, not just a hidden UI panel — this is the API
-    surface that justifies the Enterprise tier's price, so it has to be
-    enforced here even if the frontend never renders a button for it."""
+def _get_plan(user_id: str) -> str | None:
     sb = get_supabase()
     profile = single_data(
         sb.table("profiles").select("plan").eq("id", user_id).maybe_single().execute()
     )
-    plan = (profile or {}).get("plan")
-    if plan not in INTEL_PLANS:
+    return (profile or {}).get("plan")
+
+
+def _require_intel_plan(user_id: str) -> None:
+    """Enterprise-only gate, kept for the unbounded-access path. Non-Enterprise
+    callers now have a second way in — a purchased report id, checked
+    separately in /incumbent and /forecast via _consume_report / _get_report."""
+    if _get_plan(user_id) not in INTEL_PLANS:
         raise HTTPException(
             status_code=402,
-            detail="WARDOG Intel is an Enterprise-tier feature. Upgrade to unlock incumbent and award-history intelligence.",
+            detail="WARDOG Intel is an Enterprise-tier feature, or buy a single report à la carte for $39.",
         )
+
+
+def _get_report(report_id: str, user_id: str) -> dict:
+    sb = get_supabase()
+    row = single_data(
+        sb.table("wardog_intel_reports")
+        .select("*")
+        .eq("id", report_id)
+        .eq("user_id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return row
 
 
 @router.get("/incumbent")
@@ -57,15 +83,36 @@ async def get_incumbent_history(
     naics: str = Query(..., description="NAICS code, e.g. 561720"),
     agency: str = Query("", description="Top-tier awarding agency name, blank = all agencies"),
     user_id: str = Query(..., description="Caller's user id, for the owner + plan gate"),
+    report_id: str = Query("", description="A purchased à la carte report id — required for non-Enterprise users"),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """Recent prime awards matching this NAICS (+ optional agency), pulled
     live from USASpending.gov. No API key required — it's a public
     dataset — so unlike wardog.py there's no secret to keep off the
     frontend; this still lives server-side to centralize the Enterprise
-    gate and the cache."""
+    gate and the cache.
+
+    Two ways in: Enterprise plan (unlimited), or a purchased report_id
+    (à la carte, $39/report — see POST /intelligence/checkout). The report
+    is consumed here, on the first pull — opening a report spends it."""
     require_owner(current_user, user_id, detail="You can only run intel lookups for your own account")
-    _require_intel_plan(user_id)
+
+    if _get_plan(user_id) not in INTEL_PLANS:
+        if not report_id:
+            raise HTTPException(
+                status_code=402,
+                detail="WARDOG Intel is an Enterprise-tier feature, or buy a single report à la carte for $39.",
+            )
+        report = _get_report(report_id, user_id)
+        if report["status"] == "pending_payment":
+            raise HTTPException(status_code=402, detail="This report hasn't been paid for yet.")
+        if report["status"] != "unused":
+            raise HTTPException(status_code=409, detail="This report has already been opened.")
+        sb = get_supabase()
+        sb.table("wardog_intel_reports").update({
+            "status": "opened", "naics": naics, "agency": agency,
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", report_id).execute()
 
     cache_key = f"intel:incumbent:{naics}:{agency}"
     cached = await cache_get(cache_key)
@@ -132,6 +179,7 @@ class ForecastRequest(BaseModel):
     title: str = ""
     awards: list[dict] = []
     user_id: str
+    report_id: str = ""  # required for non-Enterprise users — same report /incumbent opened
 
 
 FORECAST_SYSTEM_PROMPT = (
@@ -150,9 +198,25 @@ async def forecast_recompete(
     """AI synthesis on top of /incumbent's raw award list: incumbent read,
     re-compete odds, likely price band, and an entry strategy. Costs 1 AI
     credit per call — same metering as /ai/draft-section — since this is a
-    judgment call layered on top of the (free, cached) raw lookup above."""
+    judgment call layered on top of the raw lookup above. For à la carte
+    buyers the $39 report already paid for the incumbent pull; this just
+    needs the SAME report (now 'opened') to confirm they're still inside
+    the report they bought, and marks it 'completed' once the forecast runs."""
     require_owner(current_user, body.user_id, detail="You can only run intel forecasts for your own account")
-    _require_intel_plan(body.user_id)
+
+    if _get_plan(body.user_id) not in INTEL_PLANS:
+        if not body.report_id:
+            raise HTTPException(
+                status_code=402,
+                detail="WARDOG Intel is an Enterprise-tier feature, or buy a single report à la carte for $39.",
+            )
+        report = _get_report(body.report_id, body.user_id)
+        if report["status"] not in ("opened", "completed"):
+            raise HTTPException(status_code=409, detail="Pull the award history for this report before forecasting.")
+        sb = get_supabase()
+        sb.table("wardog_intel_reports").update({
+            "status": "completed", "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", body.report_id).execute()
 
     ok, balance = consume_credits(body.user_id, n=1, reason="wardog_intel_forecast")
     if not ok:
@@ -188,3 +252,59 @@ async def forecast_recompete(
         "model": result.model,
         "credits_remaining": balance,
     }
+
+
+@router.get("/reports")
+async def list_my_reports(user_id: str = Query(...), current_user: CurrentUser = Depends(get_current_user)):
+    """A buyer's report inventory — paid-but-unopened reports they can spend
+    on a search, plus opened/completed ones for history. Frontend uses the
+    'unused' ones to skip straight to a search instead of re-buying."""
+    require_owner(current_user, user_id, detail="You can only view your own reports")
+    sb = get_supabase()
+    rows = (
+        sb.table("wardog_intel_reports")
+        .select("id, status, naics, agency, created_at, opened_at, completed_at")
+        .eq("user_id", user_id)
+        .neq("status", "pending_payment")
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return {"reports": rows.data or []}
+
+
+class IntelCheckoutRequest(BaseModel):
+    user_id: str
+    email: str
+
+
+@router.post("/checkout")
+async def create_report_checkout(body: IntelCheckoutRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """Starts a $39 Stripe Checkout session for one à la carte WARDOG Intel
+    report. A 'pending_payment' row is created up front (not after payment)
+    so its id can ride in checkout metadata — the webhook then just flips
+    it to 'unused' rather than having to create it from scratch, keeping
+    the same create-before-pay pattern gift_cards.py / wallet passes use
+    for one-time purchases that need a pre-existing row to update."""
+    require_owner(current_user, body.user_id, detail="You can only start checkout for your own account")
+    if not settings.stripe_price_wardog_intel_report:
+        raise HTTPException(status_code=503, detail="WARDOG Intel à la carte isn't configured yet")
+
+    sb = get_supabase()
+    inserted = (
+        sb.table("wardog_intel_reports")
+        .insert({"user_id": body.user_id, "status": "pending_payment"})
+        .execute()
+    )
+    report_id = inserted.data[0]["id"]
+
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        payment_method_types=["card"],
+        line_items=[{"price": settings.stripe_price_wardog_intel_report, "quantity": 1}],
+        customer_email=body.email,
+        metadata={"kind": "wardog_intel_report", "user_id": body.user_id, "report_id": report_id},
+        success_url=f"{settings.frontend_url}/dashboard?intel_unlock=success&report_id={report_id}",
+        cancel_url=f"{settings.frontend_url}/dashboard?intel_unlock=cancelled",
+    )
+    return {"url": session.url, "report_id": report_id}
