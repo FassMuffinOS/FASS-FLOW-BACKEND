@@ -544,12 +544,29 @@ async def pricing_check(x_admin_secret: str = Header(None)):
 
 @router.get("/portal/{user_id}")
 async def customer_portal(user_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Handles both product lines: a GovCon customer has stripe_customer_id
+    set, a Regulars (wallet-only) customer has wallet_stripe_customer_id
+    set instead — never both. Previously this only ever read
+    stripe_customer_id, so a wallet-only user hit a Stripe API error
+    (customer=None) and, even fixed, would've been bounced to the GovCon
+    /dashboard on return instead of their own /regulars/dashboard."""
     require_owner(current_user, user_id, detail="You can only manage your own billing")
     sb = get_supabase()
-    result = sb.table("profiles").select("stripe_customer_id").eq("id", user_id).single().execute()
-    customer_id = result.data["stripe_customer_id"]
+    result = (
+        sb.table("profiles")
+        .select("stripe_customer_id, wallet_stripe_customer_id, is_wallet_only")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
+    row = result.data or {}
+    is_wallet_only = bool(row.get("is_wallet_only"))
+    customer_id = row.get("wallet_stripe_customer_id") if is_wallet_only else row.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="No billing account on file yet")
+
     session = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{settings.frontend_url}/dashboard",
+        return_url=f"{settings.frontend_url}/{'regulars/dashboard' if is_wallet_only else 'dashboard'}",
     )
     return {"url": session.url}
