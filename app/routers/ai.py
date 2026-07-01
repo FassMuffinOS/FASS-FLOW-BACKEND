@@ -151,7 +151,16 @@ with generic claims. Write in a confident, plain, specific register — no buzzw
 
 
 @router.post("/draft-section")
-async def draft_section(body: DraftSectionRequest):
+async def draft_section(body: DraftSectionRequest, current_user: CurrentUser = Depends(get_current_user)):
+    # 2026-07-01: this was the one /ai endpoint without a get_current_user
+    # dependency or a require_owner check on body.user_id, despite spending
+    # a real, finite resource (AI credits) keyed on that id — anyone who
+    # knew another user's id could drain their credit balance for free by
+    # passing it here. Every sibling endpoint in this file already guards
+    # this exact way; this just brings draft-section in line with them.
+    if body.user_id:
+        require_owner(current_user, body.user_id, detail="You can only spend your own account's AI credits")
+
     # Meter against AI credits when a user is identified. 402 = out of credits,
     # so the client can prompt a refill instead of silently failing.
     remaining_credits = None

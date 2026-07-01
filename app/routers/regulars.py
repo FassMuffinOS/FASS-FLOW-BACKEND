@@ -19,9 +19,10 @@ product on this platform uses.
 from datetime import datetime, timezone
 
 import stripe
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.config import settings
 from app.database import get_supabase, single_data
 from app.routers.subscriptions import REGULARS_PLAN_PRICE_MAP, REGULARS_ANNUAL_PLAN_PRICE_MAP
@@ -144,11 +145,19 @@ async def signup(body: SignupRequest):
 
 
 @router.get("/status")
-async def regulars_status(user_id: str = Query(...)):
+async def regulars_status(user_id: str = Query(...), current_user: CurrentUser = Depends(get_current_user)):
     """Lightweight poll for the post-checkout redirect — same idea as
     gift_cards.py's /purchase/status — so the dashboard can show 'activating
     your subscription...' until the webhook lands instead of a confusing
-    blank state."""
+    blank state.
+
+    2026-07-01: this used to trust the query-string user_id with no session
+    check — unlike gift_cards.py's /purchase/status (keyed by an unguessable
+    random slug, safe to leave public), this was keyed directly on a user id,
+    the exact IDOR pattern flagged by scripts/security_scan.py. The frontend
+    only ever calls this once it already has a session (RegularsDashboard.jsx
+    reads session.user.id), so requiring one here doesn't break anything."""
+    require_owner(current_user, user_id, detail="You can only check your own account status")
     sb = get_supabase()
     profile = single_data(
         sb.table("profiles")
