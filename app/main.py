@@ -10,7 +10,7 @@ from app.security import (
     RequestLogMiddleware,
     log_unhandled_exception,
 )
-from app.routers import auth, subscriptions, users, ai, admin, wardog, network, business_lookup, wallet, wallet_passkit, wallet_campaigns, rewards, business_profile, gift_cards, stripe_connect, notebook, partners, chat, comms, bd_partner, affiliates, profiles, ingest, feed, careers, growth_challenge, reuse_library, proposal_docs, credits, settings as settings_router, intelligence, regulars
+from app.routers import auth, subscriptions, users, ai, admin, wardog, network, business_lookup, wallet, wallet_passkit, wallet_campaigns, rewards, business_profile, gift_cards, stripe_connect, notebook, partners, chat, comms, bd_partner, affiliates, profiles, ingest, feed, careers, growth_challenge, reuse_library, proposal_docs, credits, settings as settings_router, intelligence, regulars, tenants
 
 configure_logging()
 
@@ -80,6 +80,7 @@ app.include_router(credits.router, prefix="/api/v1")
 app.include_router(settings_router.router, prefix="/api/v1")
 app.include_router(intelligence.router, prefix="/api/v1")
 app.include_router(regulars.router, prefix="/api/v1")
+app.include_router(tenants.router, prefix="/api/v1")
 
 
 @app.get("/health")
