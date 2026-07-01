@@ -119,7 +119,7 @@ async def join_program(body: JoinRequest):
     sb = get_supabase()
     program = single_data(
         sb.table("reward_programs")
-        .select("business_name")
+        .select("business_name, bg_color, reward_threshold")
         .eq("business_user_id", body.business_user_id)
         .maybe_single()
         .execute()
@@ -136,7 +136,15 @@ async def join_program(body: JoinRequest):
         "stamps": 0,
     }
     sb.table("reward_cards").insert(row).execute()
-    return {"slug": slug}
+    # business_name/bg_color/reward_threshold ride along so the join page can
+    # render an accurate "flip and fly into Wallet" animation of the real
+    # card before the actual .pkpass download fires — not just a bare slug.
+    return {
+        "slug": slug,
+        "business_name": program["business_name"],
+        "bg_color": program.get("bg_color"),
+        "reward_threshold": program.get("reward_threshold") or 10,
+    }
 
 
 class StampRequest(BaseModel):
