@@ -24,6 +24,7 @@ for app code, and what's implemented here:
     using log_unhandled_exception below)
 """
 import logging
+import re
 import time
 import uuid
 
@@ -64,9 +65,30 @@ def allowed_origins() -> list[str]:
     return [
         settings.frontend_url,
         "https://flow.fass.systems",
+        "https://regulars.fass.systems",
+        "https://affiliates.fass.systems",
+        "https://fass.systems",
         "https://fassflow.com",
         "https://fass-flow-frontend.vercel.app",
     ]
+
+
+# 2026-07-01, subdomain rollout: a fixed list can't keep up with every
+# white-label tenant getting its own {slug}.fass.systems subdomain (see
+# app/routers/tenants.py) — new tenants would need a code deploy just to
+# be allowed to call their own API. Matching any *.fass.systems origin by
+# pattern instead covers flow/regulars/affiliates AND every future tenant
+# subdomain automatically. A tenant's fully custom domain (tenants.
+# custom_domain) still isn't covered by this — that's a real gap, but it
+# only matters once a tenant actually points their own DNS at us, which is
+# a distinct, later step (see tenants.py's Phase 1 scope note).
+_FASS_SYSTEMS_ORIGIN_RE = re.compile(r"^https://([a-z0-9-]+\.)*fass\.systems$")
+
+
+def is_allowed_origin(origin: str) -> bool:
+    if origin in allowed_origins():
+        return True
+    return bool(_FASS_SYSTEMS_ORIGIN_RE.match(origin))
 
 
 # Endpoints hit by other servers, not browsers — Stripe/Twilio/Apple never
@@ -109,7 +131,7 @@ class OriginEnforcementMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         origin = request.headers.get("origin")
-        if origin and origin not in allowed_origins():
+        if origin and not is_allowed_origin(origin):
             logger.warning("origin_rejected origin=%s path=%s ip=%s", origin, path, _client_ip(request))
             return JSONResponse(status_code=403, content={"detail": "Requests from this origin are not allowed."})
 

@@ -38,6 +38,11 @@ app.add_middleware(CORSMiddleware,
     # every browser request with a generic "Failed to fetch" and no useful
     # error message on either side.
     allow_origins=allowed_origins(),
+    # Covers flow/regulars/affiliates.fass.systems and any future
+    # {tenant}.fass.systems white-label subdomain without needing a code
+    # deploy every time a new one goes live — see security.py's
+    # is_allowed_origin, same pattern, kept in sync with this regex.
+    allow_origin_regex=r"https://([a-z0-9-]+\.)*fass\.systems",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
