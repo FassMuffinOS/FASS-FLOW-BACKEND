@@ -13,7 +13,7 @@ frontend's redemption confirm page reads) -> POST /campaigns/redeem records
 it and clears the offer (unless repeat_use) -> GET /campaigns/mine shows
 the business sent/redeemed counts + a rough revenue estimate.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from app.auth_deps import CurrentUser, get_current_user, require_owner
 from app.database import get_supabase, single_data
 from app.services.apns import notify_devices
+from app.services.llm import llm_router, LLMUnavailableError
 
 router = APIRouter(prefix="/campaigns", tags=["wallet-campaigns"])
 
@@ -265,4 +266,131 @@ async def lookup_card_for_redemption(slug: str = Query(..., min_length=1), busin
         "stamps": card["stamps"],
         "offer_message": message,
         "offer_detail": detail,
+    }
+
+
+INSIGHTS_SYSTEM_PROMPT = """You are a marketing advisor for a small local business (a food \
+truck, cafe, or similar) that uses digital Apple Wallet loyalty cards and one-way promotional \
+campaigns pushed straight to those cards. You will be given real, structured performance data \
+for exactly one business — campaign send/redeem counts and customer activity segments. Write a \
+short, plain-English suggestion (3-5 sentences, no headers, no bullet points, no markdown) that:
+
+- References the actual numbers you were given (counts, rates, names of campaigns) rather than \
+speaking generically.
+- Says plainly which campaign (if any) performed best or worst, by redemption rate.
+- Calls out the going-quiet customer count if it's non-trivial, and suggests one concrete next \
+move to win them back (e.g. a specific kind of offer, or targeting just that segment).
+- If there isn't enough data yet to say anything meaningful (e.g. no campaigns sent, or only a \
+handful of customers), say that plainly and suggest the single most useful next action instead \
+of inventing insights.
+
+Do not invent numbers, customer names, or outcomes that weren't given to you. Do not use the \
+words "leverage", "optimize", or "synergy". Respond with ONLY the suggestion paragraph."""
+
+
+@router.get("/insights")
+async def get_campaign_insights(user_id: str = Query(..., min_length=1), current_user: CurrentUser = Depends(get_current_user)):
+    """Regulars' Insights tab: per-campaign performance, a going-quiet vs.
+    active customer breakdown, and one AI-generated suggestion paragraph
+    grounded in that real data — not a canned tip. Reuses the same
+    sent/redeemed computation as /campaigns/mine so the numbers here always
+    match what the campaign list shows."""
+    require_owner(current_user, user_id, detail="You can only view your own insights")
+    sb = get_supabase()
+
+    campaigns = (
+        sb.table("wallet_campaigns")
+        .select("*")
+        .eq("business_user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    ).data or []
+
+    cards = (
+        sb.table("reward_cards")
+        .select("slug, stamps, redeemed_count, created_at, updated_at")
+        .eq("business_user_id", user_id)
+        .execute()
+    ).data or []
+
+    campaign_stats = []
+    for c in campaigns:
+        redeemed = len(
+            (
+                sb.table("wallet_campaign_redemptions")
+                .select("id")
+                .eq("campaign_id", c["id"])
+                .execute()
+            ).data
+            or []
+        )
+        sent = c.get("sent_count") or 0
+        rate = round((redeemed / sent) * 100, 1) if sent else 0.0
+        campaign_stats.append({
+            "id": c["id"],
+            "message": c["message"],
+            "created_at": c.get("created_at"),
+            "sent_count": sent,
+            "redeemed_count": redeemed,
+            "redemption_rate": rate,
+        })
+
+    now = datetime.now(timezone.utc)
+    active_cutoff = now - timedelta(days=14)
+    quiet_cutoff = now - timedelta(days=30)
+
+    active_count = 0
+    going_quiet_count = 0
+    lapsed_count = 0
+    for card in cards:
+        updated = _parse_ts(card.get("updated_at")) or _parse_ts(card.get("created_at"))
+        if not updated:
+            continue
+        if updated >= active_cutoff:
+            active_count += 1
+        elif updated >= quiet_cutoff:
+            going_quiet_count += 1
+        else:
+            lapsed_count += 1
+
+    segments = {
+        "total_customers": len(cards),
+        "active": active_count,
+        "going_quiet": going_quiet_count,
+        "lapsed": lapsed_count,
+    }
+
+    best = max(campaign_stats, key=lambda c: c["redemption_rate"], default=None) if any(c["sent_count"] for c in campaign_stats) else None
+    worst = min(campaign_stats, key=lambda c: c["redemption_rate"], default=None) if len(campaign_stats) > 1 else None
+
+    prompt = (
+        f"Total customers with a wallet card: {segments['total_customers']}\n"
+        f"Active (stamped/visited in last 14 days): {segments['active']}\n"
+        f"Going quiet (14-30 days since last activity): {segments['going_quiet']}\n"
+        f"Lapsed (30+ days since last activity): {segments['lapsed']}\n\n"
+        f"Campaigns sent ({len(campaign_stats)} total):\n"
+    )
+    if campaign_stats:
+        for c in campaign_stats:
+            prompt += f"- \"{c['message']}\": sent to {c['sent_count']}, redeemed by {c['redeemed_count']} ({c['redemption_rate']}% redemption rate)\n"
+    else:
+        prompt += "- none sent yet\n"
+    if best:
+        prompt += f"\nBest performing campaign by redemption rate: \"{best['message']}\" at {best['redemption_rate']}%\n"
+    if worst and worst is not best:
+        prompt += f"Worst performing campaign by redemption rate: \"{worst['message']}\" at {worst['redemption_rate']}%\n"
+
+    ai_suggestion = None
+    ai_error = None
+    try:
+        result = await llm_router.complete(system=INSIGHTS_SYSTEM_PROMPT, prompt=prompt, max_tokens=300)
+        ai_suggestion = result.text.strip()
+    except LLMUnavailableError as e:
+        ai_error = str(e)
+
+    return {
+        "campaigns": campaign_stats,
+        "segments": segments,
+        "ai_suggestion": ai_suggestion,
+        "ai_error": ai_error,
     }
