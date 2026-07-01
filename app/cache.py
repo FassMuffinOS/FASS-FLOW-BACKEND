@@ -25,9 +25,15 @@ async def cache_get(key: str) -> Any | None:
     return json.loads(val)
 
 
-async def cache_set(key: str, value: Any, ex: int = 300) -> None:
+async def cache_set(key: str, value: Any, ex: int | None = 300) -> None:
+    """ex=None writes a persistent key with no TTL — used for things like the
+    security IP blocklist (app/security.py) that must survive indefinitely,
+    not just for a caching window."""
     r = get_redis()
-    r.set(key, json.dumps(value), ex=ex)
+    if ex is None:
+        r.set(key, json.dumps(value))
+    else:
+        r.set(key, json.dumps(value), ex=ex)
 
 
 async def cache_delete(key: str) -> None:

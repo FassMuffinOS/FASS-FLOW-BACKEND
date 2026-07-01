@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, EmailStr
 from app.config import settings
 from app.database import get_supabase
+from app.security import list_blocked_ips, block_ip, unblock_ip
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -144,3 +145,32 @@ async def run_security_scan(x_admin_secret: str = Header(None)):
         raise HTTPException(status_code=500, detail=f"Scanner output was not valid JSON: {proc.stdout[-2000:]}")
 
     return payload
+
+
+class IPBlockRequest(BaseModel):
+    ip: str
+    reason: str = ""
+
+
+@router.get("/ip-blocks")
+async def get_ip_blocks(x_admin_secret: str = Header(None)):
+    """Powers the IP-blocking panel on the Security Dashboard. See
+    app/security.py's IPBlockMiddleware — every request is checked against
+    this list (stored in Redis so it applies across however many Railway
+    instances are running) before it reaches rate limiting or any route."""
+    _check_admin_secret(x_admin_secret)
+    return {"blocked": await list_blocked_ips()}
+
+
+@router.post("/ip-blocks")
+async def add_ip_block(body: IPBlockRequest, x_admin_secret: str = Header(None)):
+    _check_admin_secret(x_admin_secret)
+    if not body.ip.strip():
+        raise HTTPException(status_code=400, detail="ip is required")
+    return {"blocked": await block_ip(body.ip.strip(), body.reason)}
+
+
+@router.delete("/ip-blocks/{ip}")
+async def remove_ip_block(ip: str, x_admin_secret: str = Header(None)):
+    _check_admin_secret(x_admin_secret)
+    return {"blocked": await unblock_ip(ip)}
