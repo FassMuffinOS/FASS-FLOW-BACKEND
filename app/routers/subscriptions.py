@@ -9,6 +9,12 @@ from app.config import settings
 from app.database import get_supabase
 from app.routers.affiliates import record_conversion
 from app.routers.credits import grant_purchased_credits
+from app.routers.data_api import (
+    apply_subscription_plan,
+    get_or_create_customer_by_email,
+    grant_purchased_calls,
+    issue_first_key_if_needed,
+)
 
 stripe.api_key = settings.stripe_secret_key
 
@@ -76,6 +82,22 @@ def _plan_from_subscription(sub) -> str | None:
         price_id = (item.get("price") or {}).get("id")
         if price_id in PRICE_TO_PLAN_MAP:
             return PRICE_TO_PLAN_MAP[price_id]
+    return None
+
+
+def _data_api_plan_from_subscription(sub) -> tuple[str, int] | None:
+    """Unlike PRICE_TO_PLAN_MAP above (a hardcoded map from settings price
+    ids), the Data API plan/quota travel on the PRICE's own metadata — see
+    data_api.py's Stripe price creation. Embedded price objects on a
+    subscription's items include metadata by default, no expand needed."""
+    items = (sub.get("items") or {}).get("data") or []
+    for item in items:
+        price = item.get("price") or {}
+        if price.get("product") != settings.stripe_product_data_api:
+            continue
+        meta = price.get("metadata") or {}
+        if meta.get("monthly_quota"):
+            return meta.get("plan", "data_api"), int(meta["monthly_quota"])
     return None
 
 
@@ -204,6 +226,38 @@ async def stripe_webhook(
             # No commission fired here — same reasoning as the GovCon
             # subscription branch below: invoice.payment_succeeded is the
             # single source of truth, first cycle and every renewal alike.
+        elif metadata.get("kind") == "data_api_subscription":
+            # New external Data API customer subscribing to a monthly plan —
+            # see data_api.py's /checkout/subscription. No FASS user_id
+            # exists for these buyers; the customer row is keyed on email
+            # instead, created here on first purchase. Quota is applied here
+            # for the first cycle AND refreshed again by invoice.paid below
+            # every renewal (plan_used resets to 0 each period).
+            email = metadata.get("email")
+            company_name = metadata.get("company_name") or email
+            plan = metadata.get("plan")
+            monthly_quota = metadata.get("monthly_quota")
+            if email and plan and monthly_quota:
+                customer = get_or_create_customer_by_email(email, company_name)
+                if session.get("customer"):
+                    sb.table("data_api_customers").update(
+                        {"stripe_customer_id": session["customer"]}
+                    ).eq("id", customer["id"]).execute()
+                apply_subscription_plan(customer["id"], plan, int(monthly_quota))
+                await issue_first_key_if_needed(customer["id"], session["id"])
+        elif metadata.get("kind") == "data_api_credits":
+            # Pay-per-call credit pack for a new or existing external Data
+            # API customer — see data_api.py's /checkout/credits.
+            # external_ref=session["id"] on the ledger insert is the dedupe
+            # against Stripe's at-least-once webhook delivery (same
+            # mechanics as grant_purchased_credits for AI credits).
+            email = metadata.get("email")
+            company_name = metadata.get("company_name") or email
+            credits_amount = metadata.get("credits")
+            if email and credits_amount:
+                customer = get_or_create_customer_by_email(email, company_name)
+                grant_purchased_calls(customer["id"], int(credits_amount), external_ref=session["id"])
+                await issue_first_key_if_needed(customer["id"], session["id"])
         elif metadata.get("kind") == "ai_credits":
             # AI credit pack purchase — mode="payment", see credits.py's
             # /checkout. external_ref=session["id"] makes a redelivered
@@ -330,6 +384,30 @@ async def stripe_webhook(
             .eq("wallet_stripe_customer_id", inv["customer"])
             .execute()
         )
+
+        # Data API subscription renewal — refresh the monthly call quota
+        # (plan_used back to 0, period rolled forward) on every successful
+        # invoice, first cycle and renewals alike. Only fires for customers
+        # we've already linked a stripe_customer_id for (set on
+        # checkout.session.completed above), and only for actual
+        # subscription invoices — a one-time credit-pack purchase never
+        # produces an invoice.paid event at all (mode="payment").
+        if event["type"] in ("invoice.payment_succeeded", "invoice.paid") and inv.get("subscription"):
+            data_api_customer = (
+                sb.table("data_api_customers")
+                .select("id")
+                .eq("stripe_customer_id", inv["customer"])
+                .maybe_single()
+                .execute()
+            )
+            if data_api_customer and data_api_customer.data:
+                try:
+                    sub = stripe.Subscription.retrieve(inv["subscription"])
+                    plan_info = _data_api_plan_from_subscription(sub)
+                    if plan_info:
+                        apply_subscription_plan(data_api_customer.data["id"], plan_info[0], plan_info[1])
+                except Exception:
+                    pass  # never let a quota-refresh hiccup fail the whole webhook
 
         # Subscription commission lives here, and only here — see the long
         # comment up in checkout.session.completed for why. Fires on the

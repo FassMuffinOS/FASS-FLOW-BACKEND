@@ -45,6 +45,14 @@ class Settings(BaseSettings):
                                               # (the whole payment already sits in the platform
                                               # account, nothing to split yet).
 
+    # FASS Data API — external B2B access, see app/routers/data_api.py and
+    # migrations/data_api.sql. One product (prod_UoMUSCTfhHkWHt), 3 monthly
+    # plan prices (licensed recurring, metadata.monthly_quota) + 4 one-time
+    # pay-per-call packs (metadata.credits) — same "read the catalog live
+    # from Stripe" pattern as credits.py's /packs, so a price change or a
+    # new tier never needs a deploy.
+    stripe_product_data_api: str = ""
+
     # Upstash Redis
     upstash_redis_rest_url: str
     upstash_redis_rest_token: str

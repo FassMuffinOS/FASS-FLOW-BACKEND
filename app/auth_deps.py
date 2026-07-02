@@ -18,8 +18,12 @@ user_id for authorization decisions, only for things truly meant to be
 public (see gift_cards.py's /lookup, /pass, /business, /purchase/*, which
 are deliberately public storefront/QR endpoints and are NOT changed here).
 """
+import hashlib
+import secrets
+from datetime import datetime, timezone
+
 from fastapi import Header, HTTPException
-from app.database import get_supabase
+from app.database import get_supabase, single_data
 
 
 class CurrentUser:
@@ -68,3 +72,93 @@ def require_owner(current_user: CurrentUser, resource_user_id: str, detail: str 
     used everywhere instead of each router rolling its own check."""
     if current_user.id != resource_user_id:
         raise HTTPException(status_code=403, detail=detail)
+
+
+# --- FASS Data API — external B2B key auth --------------------------------
+#
+# Separate from everything above. get_current_user/CurrentUser authenticate
+# a logged-in FASS Flow *user* via a Supabase session. The Data API sells
+# programmatic access to data FASS creates (starting with WARDOG Intel) to
+# outside companies who are not FASS Flow users at all — they hold a
+# long-lived `fk_live_`/`fk_test_` key instead, matching the format already
+# documented on fass-app-docs. See migrations/data_api.sql for the schema
+# and app/routers/data_api.py for the endpoints this gates.
+
+API_KEY_PREFIX_LIVE = "fk_live_"
+API_KEY_PREFIX_TEST = "fk_test_"
+
+
+class DataAPICustomer:
+    """Minimal shape route handlers need for an authenticated external
+    Data API caller."""
+
+    def __init__(self, customer_id: str, company_name: str, key_id: str, environment: str):
+        self.customer_id = customer_id
+        self.company_name = company_name
+        self.key_id = key_id
+        self.environment = environment
+
+
+def _hash_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def generate_api_key(environment: str = "live") -> tuple[str, str, str]:
+    """Mints a new key. Returns (raw_key, key_hash, key_prefix) — raw_key is
+    shown to the caller exactly once (at issuance); only key_hash is ever
+    persisted, same as a password. key_prefix is a short, safe-to-store
+    slice of the raw key so a customer can recognize which key is which in
+    a list without us retaining the ability to reconstruct the secret."""
+    prefix = API_KEY_PREFIX_LIVE if environment == "live" else API_KEY_PREFIX_TEST
+    raw_key = f"{prefix}{secrets.token_urlsafe(32)}"
+    return raw_key, _hash_key(raw_key), raw_key[:16]
+
+
+async def require_api_key(authorization: str | None = Header(default=None)) -> DataAPICustomer:
+    """Verifies `Authorization: Bearer fk_live_...` / `fk_test_...` against
+    data_api_keys. Raises 401 if missing, malformed, unknown, or revoked.
+    Updates last_used_at best-effort (never blocks the request on that
+    write failing)."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+
+    raw_key = authorization.split(" ", 1)[1].strip()
+    if not raw_key.startswith(API_KEY_PREFIX_LIVE) and not raw_key.startswith(API_KEY_PREFIX_TEST):
+        raise HTTPException(status_code=401, detail="Malformed API key")
+
+    sb = get_supabase()
+    key_row = single_data(
+        sb.table("data_api_keys")
+        .select("id, customer_id, environment, revoked_at")
+        .eq("key_hash", _hash_key(raw_key))
+        .maybe_single()
+        .execute()
+    )
+    if not key_row:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    if key_row.get("revoked_at"):
+        raise HTTPException(status_code=401, detail="This API key has been revoked")
+
+    customer = single_data(
+        sb.table("data_api_customers")
+        .select("id, company_name")
+        .eq("id", key_row["customer_id"])
+        .maybe_single()
+        .execute()
+    )
+    if not customer:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    try:
+        sb.table("data_api_keys").update(
+            {"last_used_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", key_row["id"]).execute()
+    except Exception:
+        pass  # best-effort — never fail auth over a bookkeeping write
+
+    return DataAPICustomer(
+        customer_id=customer["id"],
+        company_name=customer["company_name"],
+        key_id=key_row["id"],
+        environment=key_row["environment"],
+    )

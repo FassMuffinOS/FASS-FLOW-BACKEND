@@ -114,6 +114,14 @@ async def get_incumbent_history(
             "opened_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", report_id).execute()
 
+    return await fetch_incumbent_awards(naics, agency)
+
+
+async def fetch_incumbent_awards(naics: str, agency: str = "") -> dict:
+    """The actual USASpending.gov pull + shaping, factored out of the route
+    above so app/routers/data_api.py's external endpoint can call the exact
+    same logic (including the cache) without duplicating it or importing a
+    FastAPI route function directly."""
     cache_key = f"intel:incumbent:{naics}:{agency}"
     cached = await cache_get(cache_key)
     if cached is not None:
